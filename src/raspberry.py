@@ -6,10 +6,10 @@ import time
 import threading
 
 # Open serial port to Arduino
-arduino = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)  # Change the port name
+arduino = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
 time.sleep(2)  # Wait for Arduino to reset
 
-# Message sends to Arduino
+# Message sent to Arduino
 def send_coordinates(center_frame, center_object):
     data = f"{center_frame[0]},{center_frame[1]},{center_object[0]},{center_object[1]}\n"
     arduino.write(data.encode())
@@ -20,7 +20,7 @@ GPIO.setmode(GPIO.BCM)
 # Setup relay
 RELAY_PIN = 17
 GPIO.setup(RELAY_PIN, GPIO.OUT)
-GPIO.output(RELAY_PIN, GPIO.HIGH) # Initially off; HIGH = OFF, LOW = ON
+GPIO.output(RELAY_PIN, GPIO.HIGH) # Initially off; HIGH = OFF, LOW = ON (temp fix inverted)
 
 def trigger_relay(duration=5):
     print("Relay ON")
@@ -29,7 +29,7 @@ def trigger_relay(duration=5):
     GPIO.output(RELAY_PIN, GPIO.HIGH)
     print("Relay OFF")
     
-
+#fix for video feed lag/delay
 def trigger_relay_async(duration=5):
     threading.Thread(target=trigger_relay, args=(duration,), daemon=True).start()
 
@@ -128,7 +128,7 @@ if __name__ == "__main__":
             cv2.circle(img, frame_center, 6, (0, 0, 255), -1)  # Red dot
 
             # Detect objects and mark centers of their bounding boxes
-            result, objectInfo = getObjects(img, 0.45, 0.2, objects=['cup'])
+            result, objectInfo = getObjects(img, 0.45, 0.2, objects=['cell phone'])
 
             # Find the biggest bbox (for objects above area threshold)
             biggest_box = None
@@ -186,3 +186,4 @@ if __name__ == "__main__":
         cv2.destroyAllWindows()
         GPIO.cleanup()
         arduino.close()
+
