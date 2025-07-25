@@ -169,9 +169,17 @@ if __name__ == "__main__":
                 alarm_off()
                 arduino.reset_input_buffer()  # clear any old "ALIGNED" messages
 
+                # Passive scan
+                arduino.write(b'SCAN\n')
+                print("Passive scanning...")
+                time.sleep(0.1)  # adjust delay if needed
+
             cv2.imshow("Output", img)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
+            elif cv2.waitKey(1) & 0xFF == ord('h'):
+                arduino.write(b'HOME\n')
+                print("Sent HOME command to Arduino")
 
 
     except UnicodeDecodeError:
