@@ -3,13 +3,13 @@ import cv2
 
 # Load class names
 classNames = []
-classFile = "/home/eutech/Desktop/PawStopper Robot/Object_Detection_Files/coco.names"
+classFile = "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/coco.names"
 with open(classFile, "rt") as f:
     classNames = f.read().rstrip("\n").split("\n")
 
 # Load model config and weights
-configPath = "/home/eutech/Desktop/PawStopper Robot/Object_Detection_Files/ssd_mobilenet_v3_large_coco_2020_01_14.pbtxt"
-weightsPath = "/home/eutech/Desktop/PawStopper Robot/Object_Detection_Files/frozen_inference_graph.pb"
+configPath = "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/ssd_mobilenet_v3_large_coco_2020_01_14.pbtxt"
+weightsPath = "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/frozen_inference_graph.pb"
 
 # Initialize detection model
 net = cv2.dnn_DetectionModel(weightsPath, configPath)
