@@ -5,77 +5,84 @@ import serial
 import time
 import threading
 
+
+# Component setup
 # Open serial port to Arduino
-arduino = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
+arduino = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)    # The port, baud rate(should be the same as the arduino), waiting time out
 time.sleep(2)  # Wait for Arduino to reset
 
-# Message sent to Arduino
-def send_coordinates(center_frame, center_object):
-    data = f"{center_frame[0]},{center_frame[1]},{center_object[0]},{center_object[1]}\n"
-    arduino.write(data.encode())
-    print(f"Sent to Arduino: {data.strip()}")
-
-
+# GPIO setup
 GPIO.setmode(GPIO.BCM)
-# Setup relay
-RELAY_PIN = 17
+
+RELAY_PIN = 17  # Setting up the relay
 GPIO.setup(RELAY_PIN, GPIO.OUT)
-GPIO.output(RELAY_PIN, GPIO.HIGH) # Initially off; HIGH = OFF, LOW = ON (temp fix inverted)
+GPIO.output(RELAY_PIN, GPIO.HIGH)   # Initially off; HIGH = OFF, LOW = ON (temp fix inverted)--pavani
 
-def trigger_relay(duration=5):
-    print("Relay ON")
-    GPIO.output(RELAY_PIN, GPIO.LOW)
-    time.sleep(duration)
-    GPIO.output(RELAY_PIN, GPIO.HIGH)
-    print("Relay OFF")
-    
-#fix for video feed lag/delay
-def trigger_relay_async(duration=5):
-    threading.Thread(target=trigger_relay, args=(duration,), daemon=True).start()
-
-
-# Setup the alarm system
-ALARM_PIN = 18
+ALARM_PIN = 18  # Setting up the alarm system(Buzzer)
 GPIO.setup(ALARM_PIN, GPIO.OUT)
 
-def alarm_on():
-    GPIO.output(ALARM_PIN, GPIO.HIGH)
 
-def alarm_off():
-    GPIO.output(ALARM_PIN, GPIO.LOW)
-
-# Load class names from coco names to a list named classNames
+# Image detection setup
+# Loads class names from coco names to a list named classNames
 classNames = []
 classFile = "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/coco.names"
-with open(classFile, "rt") as f:
+with open(classFile, "rt") as f:    # rt: read as texts(Strings)
     classNames = f.read().rstrip("\n").split("\n")
 
-# Load model config and weights
+# Loads model configs and weights
 configPath = "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/ssd_mobilenet_v3_large_coco_2020_01_14.pbtxt"
 weightsPath = "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/frozen_inference_graph.pb"
 
 # Initialize detection model
 net = cv2.dnn_DetectionModel(weightsPath, configPath)
-net.setInputSize(320, 320)
-net.setInputScale(1.0 / 127.5)
-net.setInputMean((127.5, 127.5, 127.5))
-net.setInputSwapRB(True)
+net.setInputSize(320, 320)  # Resizes the input image to 320 x 320 pixels before passing it to the neural network. Higher resolution: better accuracy but become slower
+net.setInputScale(1.0 / 127.5)  # Normalizes pixel values from [0, 255] range to [0, 2] range
+net.setInputMean((127.5, 127.5, 127.5)) # Subtracts a mean value from each color channel (R, G, B)
+net.setInputSwapRB(True)    # Swap color channels from BGR to RGB
 
-# Function to detect objects and mark centers
+
+# Functions
+# Function: Sends the center codes to the arduino
+def send_coordinates(frame_center, object_center):
+    data = f"{frame_center[0]},{frame_center[1]},{object_center[0]},{object_center[1]}\n"   # 0:x cordination, 1:y cordination
+    arduino.write(data.encode())    # Encode convert the string to binary
+    print(f"Sent to Arduino: {data.strip()}")   # Prints the message to the rasberry console as well. .strip() remove the /n at the end
+
+# Function: Triggers the relay
+def trigger_relay(duration=5):
+    GPIO.output(RELAY_PIN, GPIO.LOW)
+    print("Relay ON")
+    time.sleep(duration)
+    GPIO.output(RELAY_PIN, GPIO.HIGH)   # Change HIGH and LOW if the relay misbehaves
+    print("Relay OFF")
+    
+# Function: Fix for video feed lag/delay--pavani
+def trigger_relay_async(duration=5):
+    threading.Thread(target=trigger_relay, args=(duration,), daemon=True).start()   # A daemon thread will execute and be killed automatically
+
+# Function: Turn alarm on
+def alarm_on():
+    GPIO.output(ALARM_PIN, GPIO.HIGH)
+
+# Function: Turn alarm on
+def alarm_off():
+    GPIO.output(ALARM_PIN, GPIO.LOW)
+
+# Function: Detects objects and marks the centers
 def getObjects(img, thres, nms, draw=True, objects=[]):
-    classIds, confs, bbox = net.detect(img, confThreshold=thres, nmsThreshold=nms)  #classId of the object, confs: thresholder value, bbox: (x, y, width, height)
+    classIds, confs, bbox = net.detect(img, confThreshold=thres, nmsThreshold=nms)  # classId of the object, confs: thresholder value, bbox: (x, y, width, height)
     objectInfo = []
 
     if len(objects) == 0:
-        objects = classNames
+        objects = classNames # If not defined, this detects everything
 
     if len(classIds) != 0:
         for classId, confidence, box in zip(classIds.flatten(), confs.flatten(), bbox):
             className = classNames[classId - 1]
             if className in objects:
-                # Compute center of bounding box
-                center_x = box[0] + box[2] // 2
-                center_y = box[1] + box[3] // 2
+                # Compute center of bounding box (object_center values)
+                center_x = box[0] + box[2] // 2 # 0:x position, 2:width
+                center_y = box[1] + box[3] // 2 # 1:y position, 3:height
 
                 # Append to print
                 objectInfo.append([box, className, round(confidence * 100, 2), (center_x, center_y)])
@@ -93,7 +100,7 @@ def getObjects(img, thres, nms, draw=True, objects=[]):
                                 cv2.FONT_HERSHEY_COMPLEX, 1, (0, 255, 0), 2)
                     
                     # Draw small circle at the center
-                    cv2.circle(img, (center_x, center_y), radius=5, color=(0, 255, 0), thickness=-1) #Green dot
+                    cv2.circle(img, (center_x, center_y), radius=5, color=(0, 255, 0), thickness=-1)    # Green dot
 
     return img, objectInfo
 
@@ -101,21 +108,48 @@ def getObjects(img, thres, nms, draw=True, objects=[]):
 # Main program
 if __name__ == "__main__":
     cap = cv2.VideoCapture(0)
-    cap.set(3, 640) #width
-    cap.set(4, 480) #height
+    cap.set(3, 640) # width
+    cap.set(4, 480) # height
 
-    # Optional: print frame size
+    # Prints frame size
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"Video feed size: {frame_width}x{frame_height}")
+    print(f"Camera On; Feed Size: {frame_width}x{frame_height}")
+    
+    # Check arduino connection
+    print("Checking Arduino connection...")
+    arduino.write(b'PING\n')  # Send a simple message to Arduino
+
+    timeout_start = time.time()
+    timeout_limit = 5
+    connection_established = False
     
     # Thresholder for the alarm system
-    AREA_THRESHOLD = 15000 # tune for need
+    AREA_THRESHOLD = 15000  # tune for need
 
     try:
-        # Setup the relay to cooldown
+        # Setup relay cooldown
         last_trigger_time = 0
         COOLDOWN_SECONDS = 10
+        
+        while time.time() - timeout_start < timeout_limit:
+            if arduino.in_waiting > 0:
+                msg = arduino.readline().decode().strip()
+                if msg == "PONG":
+                    print("Connection stable: Arduino ready to receive coordinates.")
+                    connection_established = True
+                    break
+                else:
+                    print(f"Unexpected response from Arduino: {msg}")
+                    break
+            time.sleep(0.1)
+
+        if not connection_established:
+            print("No response from Arduino. Please check the connection and restart.")
+            arduino.close()
+            GPIO.cleanup()
+            cap.release()
+            exit()
         
         while True:
             success, img = cap.read()
