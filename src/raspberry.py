@@ -347,7 +347,7 @@ class PawStopperController:
             target_objects=['cell phone']
         )
         
-        biggest_box = self._find_biggest_detection(detections)
+        biggest_box = self._find_first_detection(detections)
         
         if biggest_box:
             bbox_center = (
@@ -368,18 +368,15 @@ class PawStopperController:
             self.gpio.alarm_off()
             self.arduino.clear_buffer()
     
-    def _find_biggest_detection(self, detections: List) -> Optional[tuple]:
-        """Find the largest detected object above threshold.
+    def _find_first_detection(self, detections: List) -> Optional[tuple]:
+        """Find the first detected object above threshold.
         
         Args:
             detections: List of detected objects
             
         Returns:
-            Bounding box of largest object or None
+            Bounding box of first qualifying object or None
         """
-        biggest_box = None
-        max_area = 0
-        
         for box, name, confidence, center in detections:
             bbox_area = box[2] * box[3]
             logger.debug(
@@ -388,11 +385,11 @@ class PawStopperController:
                 f"Area: {bbox_area}"
             )
             
-            if bbox_area > self.AREA_THRESHOLD and bbox_area > max_area:
-                max_area = bbox_area
-                biggest_box = box
+            if bbox_area > self.AREA_THRESHOLD:
+                logger.info(f"First target selected: {name.upper()} (Area: {bbox_area})")
+                return box
         
-        return biggest_box
+        return None
     
     def _check_alignment(self) -> bool:
         """Check if Arduino reports alignment."""
