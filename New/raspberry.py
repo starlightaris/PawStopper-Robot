@@ -19,21 +19,37 @@ class StepperController:
     def send_step_command(self, axis, direction, steps):
         """Send step command to Arduino and wait for confirmation"""
         cmd = f"STEP {axis} {direction} {steps}\n"
+        
+        # Clear any pending data before sending command
+        self.arduino.reset_input_buffer()
+        time.sleep(0.05)  # Small delay to ensure buffer is clear
+        
         self.arduino.write(cmd.encode())
         print(f"Sent: {cmd.strip()}")
         
         # Wait for acknowledgment
         start_time = time.time()
-        while time.time() - start_time < 2.0:  # Increased timeout to 2 seconds
+        responses_received = []
+        
+        while time.time() - start_time < 3.0:  # Increased timeout to 3 seconds
             if self.arduino.in_waiting > 0:
-                response = self.arduino.readline().decode().strip()
-                print(f"Arduino response: {response}")
-                if response == f"{axis}_OK":
-                    return True
-                elif response in ["X_OK", "Y_OK"]:
-                    print(f"Warning: Expected {axis}_OK but got {response}")
-                    return response == f"{axis}_OK"
+                try:
+                    response = self.arduino.readline().decode().strip()
+                    responses_received.append(response)
+                    print(f"Arduino response: '{response}'")
+                    
+                    if response == f"{axis}_OK":
+                        return True
+                    elif response in ["X_OK", "Y_OK"]:
+                        print(f"Warning: Expected {axis}_OK but got {response}")
+                        return response == f"{axis}_OK"
+                except UnicodeDecodeError:
+                    print("Warning: Received malformed data from Arduino")
+                    continue
+            time.sleep(0.01)  # Small delay to prevent busy waiting
+        
         print(f"Timeout waiting for {axis}_OK acknowledgment")
+        print(f"All responses received: {responses_received}")
         return False
     
     def step_x(self, direction, steps):
@@ -66,9 +82,29 @@ class StepperController:
             print("Y step command failed - position not updated")
             return False
     
+    def test_connection(self):
+        """Test Arduino connection with a simple command"""
+        print("Testing Arduino connection...")
+        
+        # Try a small movement to test communication
+        test_success = self.send_step_command("X", "FORWARD", 1)
+        if test_success:
+            print("Connection test successful!")
+            # Return to original position
+            self.send_step_command("X", "BACKWARD", 1)
+            return True
+        else:
+            print("Connection test failed!")
+            return False
+    
     def go_home(self):
         """Return both axes to logical zero position"""
         print(f"Going home from position: ({self.current_pos_x}, {self.current_pos_y})")
+        
+        # Test connection first
+        if not self.test_connection():
+            print("Cannot proceed with homing - Arduino communication failed")
+            return False
         
         self.is_homing = True
         
@@ -85,22 +121,35 @@ class StepperController:
             print(f"Homing X axis: {steps} steps {direction}")
             
             # For large movements, break into smaller chunks
-            max_chunk = 200
+            max_chunk = 50  # Reduced chunk size for better reliability
             remaining_steps = steps
+            retry_count = 0
+            max_retries = 3
             
-            while remaining_steps > 0 and home_success:
+            while remaining_steps > 0 and home_success and retry_count < max_retries:
                 chunk_steps = min(remaining_steps, max_chunk)
+                print(f"Attempting X movement: {chunk_steps} steps {direction} (attempt {retry_count + 1})")
+                
                 if self.step_x(direction, chunk_steps):
                     remaining_steps -= chunk_steps
+                    retry_count = 0  # Reset retry count on success
                     print(f"X homing progress: {steps - remaining_steps}/{steps} steps")
                 else:
-                    print("X homing failed!")
-                    home_success = False
-                    break
+                    retry_count += 1
+                    print(f"X step failed! Retry {retry_count}/{max_retries}")
+                    if retry_count >= max_retries:
+                        print("X homing failed after maximum retries!")
+                        home_success = False
+                        break
+                    else:
+                        time.sleep(0.5)  # Wait before retry
             
-            if home_success:
+            if home_success and remaining_steps == 0:
                 self.current_pos_x = 0
                 print("X axis homed successfully")
+            elif remaining_steps > 0:
+                print(f"X homing incomplete! {remaining_steps} steps remaining")
+                home_success = False
         
         # Home Y axis
         if self.current_pos_y != 0 and home_success:
@@ -109,22 +158,35 @@ class StepperController:
             print(f"Homing Y axis: {steps} steps {direction}")
             
             # For large movements, break into smaller chunks
-            max_chunk = 200
+            max_chunk = 50  # Reduced chunk size for better reliability
             remaining_steps = steps
+            retry_count = 0
+            max_retries = 3
             
-            while remaining_steps > 0 and home_success:
+            while remaining_steps > 0 and home_success and retry_count < max_retries:
                 chunk_steps = min(remaining_steps, max_chunk)
+                print(f"Attempting Y movement: {chunk_steps} steps {direction} (attempt {retry_count + 1})")
+                
                 if self.step_y(direction, chunk_steps):
                     remaining_steps -= chunk_steps
+                    retry_count = 0  # Reset retry count on success
                     print(f"Y homing progress: {steps - remaining_steps}/{steps} steps")
                 else:
-                    print("Y homing failed!")
-                    home_success = False
-                    break
+                    retry_count += 1
+                    print(f"Y step failed! Retry {retry_count}/{max_retries}")
+                    if retry_count >= max_retries:
+                        print("Y homing failed after maximum retries!")
+                        home_success = False
+                        break
+                    else:
+                        time.sleep(0.5)  # Wait before retry
             
-            if home_success:
+            if home_success and remaining_steps == 0:
                 self.current_pos_y = 0
                 print("Y axis homed successfully")
+            elif remaining_steps > 0:
+                print(f"Y homing incomplete! {remaining_steps} steps remaining")
+                home_success = False
         
         self.is_homing = False
         
@@ -342,7 +404,7 @@ def display_position_info(img, stepper):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     
     # Add control instructions
-    cv2.putText(img, "Controls: Q=Quit, R=Reset Pos, H=Home, P=Print Info", 
+    cv2.putText(img, "Controls: Q=Quit, R=Reset, H=Home, P=Info", 
                 (10, img.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
 if __name__ == "__main__":
