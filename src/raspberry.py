@@ -97,7 +97,7 @@ if __name__ == "__main__":
             frame_center = (frame_width//2, frame_height//2)
             cv2.circle(img, frame_center, 6, (0,0,255), -1)  # Red center dot
 
-            result, objectInfo = getObjects(img,0.45,0.2,objects=['cell_phone'])  # change object name here
+            result, objectInfo = getObjects(img,0.45,0.2,objects=['cell phone'])  # change object name here
 
             biggest_box = None
             max_area = 0
@@ -166,7 +166,7 @@ if __name__ == "__main__":
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 print("[INFO] Quitting. Sending robot to home position.")
                 arduino.write(b'HOME\n')
-                time.sleep(2)  # wait for Arduino to complete movement
+                #time.sleep(5)  # wait for Arduino to complete movement
                 break
 
 
