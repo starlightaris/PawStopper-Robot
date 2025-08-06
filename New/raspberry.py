@@ -18,57 +18,117 @@ class StepperController:
         """Send step command to Arduino and wait for confirmation"""
         cmd = f"STEP {axis} {direction} {steps}\n"
         self.arduino.write(cmd.encode())
+        print(f"Sent: {cmd.strip()}")
         
         # Wait for acknowledgment
         start_time = time.time()
-        while time.time() - start_time < 1.0:  # 1 second timeout
+        while time.time() - start_time < 2.0:  # Increased timeout to 2 seconds
             if self.arduino.in_waiting > 0:
                 response = self.arduino.readline().decode().strip()
-                if response in ["X_OK", "Y_OK"]:
+                print(f"Arduino response: {response}")
+                if response == f"{axis}_OK":
                     return True
+                elif response in ["X_OK", "Y_OK"]:
+                    print(f"Warning: Expected {axis}_OK but got {response}")
+                    return response == f"{axis}_OK"
+        print(f"Timeout waiting for {axis}_OK acknowledgment")
         return False
     
     def step_x(self, direction, steps):
         """Move X axis and update position tracking"""
+        print(f"Moving X axis: {direction} {steps} steps. Current pos: {self.current_pos_x}")
         if self.send_step_command("X", direction, steps):
+            old_pos = self.current_pos_x
             if direction == "FORWARD":
                 self.current_pos_x += steps
             else:
                 self.current_pos_x -= steps
+            print(f"X position updated: {old_pos} -> {self.current_pos_x}")
             return True
-        return False
+        else:
+            print("X step command failed - position not updated")
+            return False
     
     def step_y(self, direction, steps):
         """Move Y axis and update position tracking"""
+        print(f"Moving Y axis: {direction} {steps} steps. Current pos: {self.current_pos_y}")
         if self.send_step_command("Y", direction, steps):
+            old_pos = self.current_pos_y
             if direction == "FORWARD":
                 self.current_pos_y += steps
             else:
                 self.current_pos_y -= steps
+            print(f"Y position updated: {old_pos} -> {self.current_pos_y}")
             return True
-        return False
+        else:
+            print("Y step command failed - position not updated")
+            return False
     
     def go_home(self):
         """Return both axes to logical zero position"""
-        print("Going home...")
+        print(f"Going home from position: ({self.current_pos_x}, {self.current_pos_y})")
+        
+        # Clear any pending data first
+        self.arduino.reset_input_buffer()
+        time.sleep(0.1)
+        
+        home_success = True
         
         # Home X axis
         if self.current_pos_x != 0:
             direction = "BACKWARD" if self.current_pos_x > 0 else "FORWARD"
             steps = abs(self.current_pos_x)
-            if self.step_x(direction, steps):
+            print(f"Homing X axis: {steps} steps {direction}")
+            
+            # For large movements, break into smaller chunks
+            max_chunk = 200
+            remaining_steps = steps
+            
+            while remaining_steps > 0 and home_success:
+                chunk_steps = min(remaining_steps, max_chunk)
+                if self.step_x(direction, chunk_steps):
+                    remaining_steps -= chunk_steps
+                    print(f"X homing progress: {steps - remaining_steps}/{steps} steps")
+                else:
+                    print("X homing failed!")
+                    home_success = False
+                    break
+            
+            if home_success:
                 self.current_pos_x = 0
-                print(f"X axis homed")
+                print("X axis homed successfully")
         
         # Home Y axis
-        if self.current_pos_y != 0:
+        if self.current_pos_y != 0 and home_success:
             direction = "BACKWARD" if self.current_pos_y > 0 else "FORWARD"
             steps = abs(self.current_pos_y)
-            if self.step_y(direction, steps):
+            print(f"Homing Y axis: {steps} steps {direction}")
+            
+            # For large movements, break into smaller chunks
+            max_chunk = 200
+            remaining_steps = steps
+            
+            while remaining_steps > 0 and home_success:
+                chunk_steps = min(remaining_steps, max_chunk)
+                if self.step_y(direction, chunk_steps):
+                    remaining_steps -= chunk_steps
+                    print(f"Y homing progress: {steps - remaining_steps}/{steps} steps")
+                else:
+                    print("Y homing failed!")
+                    home_success = False
+                    break
+            
+            if home_success:
                 self.current_pos_y = 0
-                print(f"Y axis homed")
+                print("Y axis homed successfully")
         
-        print(f"Home complete. Position: ({self.current_pos_x}, {self.current_pos_y})")
+        if home_success:
+            print(f"Home complete. Final position: ({self.current_pos_x}, {self.current_pos_y})")
+        else:
+            print("Homing failed! Position may be inaccurate.")
+            print("Consider using manual_reset_position() if you know the actual position.")
+        
+        return home_success
     
     def track_object(self, frame_center, object_center):
         """Track object by calculating error and moving steppers accordingly"""
@@ -120,6 +180,21 @@ class StepperController:
         if step_size is not None:
             self.track_step_size = step_size
             print(f"Tracking step size updated to: {self.track_step_size}")
+    
+    def manual_reset_position(self, x=0, y=0):
+        """Manually reset position counters (use if you know the actual position)"""
+        self.current_pos_x = x
+        self.current_pos_y = y
+        print(f"Position manually reset to: ({x}, {y})")
+    
+    def get_position_info(self):
+        """Get detailed position information"""
+        return {
+            'x_position': self.current_pos_x,
+            'y_position': self.current_pos_y,
+            'tolerance': self.tolerance,
+            'track_step_size': self.track_step_size
+        }
 
 # Open serial port to Arduino
 arduino = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
@@ -220,6 +295,14 @@ def display_position_info(img, stepper):
     pos_x, pos_y = stepper.get_position()
     cv2.putText(img, f"Pos: X={pos_x}, Y={pos_y}", (10, 30), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(img, f"Tolerance: {stepper.tolerance}", (10, 55), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    cv2.putText(img, f"Step Size: {stepper.track_step_size}", (10, 75), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    # Add control instructions
+    cv2.putText(img, "Controls: Q=Quit, R=Reset Pos, H=Home, P=Print Info", 
+                (10, img.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
 if __name__ == "__main__":
     cap = cv2.VideoCapture(0)
@@ -305,12 +388,22 @@ if __name__ == "__main__":
                         print("Scan step failed, retrying...")
 
             cv2.imshow("Output", img)
-            #if cv2.waitKey(1)&0xFF == ord('q'): break
             
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            # Handle keyboard input
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 print("[INFO] Quitting. Sending robot to home position.")
                 stepper.go_home()
                 break
+            elif key == ord('r'):  # Reset position to (0,0)
+                print("[INFO] Manually resetting position to (0,0)")
+                stepper.manual_reset_position(0, 0)
+            elif key == ord('h'):  # Go home
+                print("[INFO] Manual home command")
+                stepper.go_home()
+            elif key == ord('p'):  # Print position info
+                info = stepper.get_position_info()
+                print(f"[INFO] Current position info: {info}")
 
 
     except KeyboardInterrupt:
