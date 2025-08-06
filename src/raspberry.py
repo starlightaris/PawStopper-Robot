@@ -10,6 +10,9 @@ import serial
 import time
 import threading
 import logging
+import json
+import os
+from datetime import datetime
 from typing import Tuple, List, Optional
 
 # Configure logging
@@ -23,6 +26,13 @@ logger = logging.getLogger(__name__)
 SERIAL_PORT = '/dev/ttyUSB0'
 SERIAL_BAUDRATE = 9600
 SERIAL_TIMEOUT = 1
+
+# Motor limits (in steps)
+PAN_LIMIT_STEPS = 100   # ±90 degrees (200 steps = 360°, so 100 steps = 180°)
+TILT_LIMIT_STEPS = 25   # ±45 degrees (200 steps = 360°, so 25 steps = 45°)
+
+# Position tracking file
+POSITION_FILE = "position_state.json"
 
 class ArduinoCommunicator:
     """Handles serial communication with the Arduino."""
@@ -50,6 +60,36 @@ class ArduinoCommunicator:
             logger.info(f"Sent to Arduino: {data.strip()}")
         except serial.SerialException as e:
             logger.error(f"Failed to send coordinates to Arduino: {e}")
+    
+    def send_scan_command(self) -> None:
+        """Send scan command to Arduino."""
+        try:
+            self.arduino.write(b'SCAN\n')
+            logger.debug("Scan command sent to Arduino")
+        except serial.SerialException as e:
+            logger.error(f"Failed to send scan command: {e}")
+    
+    def send_home_command(self) -> None:
+        """Send home command to Arduino."""
+        try:
+            self.arduino.write(b'HOME\n')
+            logger.info("Home command sent to Arduino")
+        except serial.SerialException as e:
+            logger.error(f"Failed to send home command: {e}")
+    
+    def send_absolute_position(self, pan_steps: int, tilt_steps: int) -> None:
+        """Send absolute position command to Arduino.
+        
+        Args:
+            pan_steps: Target pan position in steps
+            tilt_steps: Target tilt position in steps
+        """
+        try:
+            data = f"POS,{pan_steps},{tilt_steps}\n"
+            self.arduino.write(data.encode())
+            logger.info(f"Position command sent: {data.strip()}")
+        except serial.SerialException as e:
+            logger.error(f"Failed to send position command: {e}")
     
     def read_message(self) -> Optional[str]:
         """Read a message from Arduino.
@@ -79,6 +119,103 @@ class ArduinoCommunicator:
             logger.info("Arduino connection closed")
         except serial.SerialException as e:
             logger.error(f"Error closing Arduino connection: {e}")
+
+
+class PositionTracker:
+    """Tracks and manages robot position state."""
+    
+    def __init__(self, position_file: str = POSITION_FILE):
+        """Initialize position tracker.
+        
+        Args:
+            position_file: Path to position state file
+        """
+        self.position_file = position_file
+        self.pan_steps = 0
+        self.tilt_steps = 0
+        self.load_position()
+    
+    def load_position(self) -> None:
+        """Load position from file or create new if doesn't exist."""
+        try:
+            if os.path.exists(self.position_file):
+                with open(self.position_file, 'r') as f:
+                    data = json.load(f)
+                    self.pan_steps = data.get('pan_steps', 0)
+                    self.tilt_steps = data.get('tilt_steps', 0)
+                    logger.info(f"Position loaded: Pan={self.pan_steps}, Tilt={self.tilt_steps}")
+            else:
+                self.save_position()
+                logger.info("Position file created with default values")
+        except Exception as e:
+            logger.error(f"Error loading position: {e}")
+            self.pan_steps = 0
+            self.tilt_steps = 0
+    
+    def save_position(self) -> None:
+        """Save current position to file."""
+        try:
+            data = {
+                'pan_steps': self.pan_steps,
+                'tilt_steps': self.tilt_steps,
+                'last_updated': datetime.now().isoformat()
+            }
+            with open(self.position_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            logger.debug(f"Position saved: Pan={self.pan_steps}, Tilt={self.tilt_steps}")
+        except Exception as e:
+            logger.error(f"Error saving position: {e}")
+    
+    def update_position(self, pan_delta: int, tilt_delta: int) -> None:
+        """Update position by delta steps.
+        
+        Args:
+            pan_delta: Change in pan steps
+            tilt_delta: Change in tilt steps
+        """
+        self.pan_steps = max(-PAN_LIMIT_STEPS, min(PAN_LIMIT_STEPS, self.pan_steps + pan_delta))
+        self.tilt_steps = max(-TILT_LIMIT_STEPS, min(TILT_LIMIT_STEPS, self.tilt_steps + tilt_delta))
+        self.save_position()
+    
+    def reset_to_center(self) -> Tuple[int, int]:
+        """Reset position to center and return steps needed.
+        
+        Returns:
+            Tuple of (pan_steps_to_center, tilt_steps_to_center)
+        """
+        pan_to_center = -self.pan_steps
+        tilt_to_center = -self.tilt_steps
+        
+        self.pan_steps = 0
+        self.tilt_steps = 0
+        self.save_position()
+        
+        logger.info(f"Reset to center: Pan={pan_to_center}, Tilt={tilt_to_center}")
+        return pan_to_center, tilt_to_center
+    
+    def is_within_limits(self, pan_delta: int, tilt_delta: int) -> bool:
+        """Check if movement would exceed limits.
+        
+        Args:
+            pan_delta: Proposed pan movement
+            tilt_delta: Proposed tilt movement
+            
+        Returns:
+            True if movement is within limits
+        """
+        new_pan = self.pan_steps + pan_delta
+        new_tilt = self.tilt_steps + tilt_delta
+        
+        return (-PAN_LIMIT_STEPS <= new_pan <= PAN_LIMIT_STEPS and 
+                -TILT_LIMIT_STEPS <= new_tilt <= TILT_LIMIT_STEPS)
+    
+    def get_position(self) -> Tuple[int, int]:
+        """Get current position.
+        
+        Returns:
+            Tuple of (pan_steps, tilt_steps)
+        """
+        return self.pan_steps, self.tilt_steps
 
 
 class GPIOController:
@@ -324,6 +461,7 @@ class PawStopperController:
         """Initialize the PawStopper controller."""
         self.arduino = ArduinoCommunicator()
         self.gpio = GPIOController()
+        self.position_tracker = PositionTracker()
         self.detector = ObjectDetector(
             MODEL_CONFIG['CONFIG_PATH'],
             MODEL_CONFIG['WEIGHTS_PATH'],
@@ -335,6 +473,28 @@ class PawStopperController:
         self.AREA_THRESHOLD = 15000
         self.COOLDOWN_SECONDS = 10
         self.last_trigger_time = 0
+        
+        # Scanning configuration
+        self.scanning_mode = True
+        self.scan_pan_direction = 1  # 1 for right, -1 for left
+        self.scan_steps_per_move = 5
+        self.scan_height_levels = [-15, -5, 5, 15]  # Different tilt levels
+        self.current_height_index = 0
+        
+        # Initialize robot position
+        self.home_robot()
+    
+    def home_robot(self) -> None:
+        """Reset robot to center position."""
+        logger.info("Homing robot to center position...")
+        pan_to_center, tilt_to_center = self.position_tracker.reset_to_center()
+        
+        if pan_to_center != 0 or tilt_to_center != 0:
+            # Send absolute position command to center
+            self.arduino.send_absolute_position(0, 0)
+            time.sleep(2)  # Wait for movement to complete
+        
+        logger.info("Robot homed to center position")
     
     def process_frame(self, frame: np.ndarray) -> None:
         """Process a single frame.
@@ -344,15 +504,16 @@ class PawStopperController:
         """
         frame, detections = self.detector.detect_objects(
             frame,
-            target_objects=['cell phone']
+            target_objects=['cat', 'dog']
         )
         
-        biggest_box = self._find_first_detection(detections)
+        first_detection = self._find_first_detection(detections)
         
-        if biggest_box:
+        if first_detection:
+            self.scanning_mode = False
             bbox_center = (
-                biggest_box[0] + biggest_box[2] // 2,
-                biggest_box[1] + biggest_box[3] // 2
+                first_detection[0] + first_detection[2] // 2,
+                first_detection[1] + first_detection[3] // 2
             )
             logger.info(f"Target detected at {bbox_center}")
             
@@ -367,6 +528,46 @@ class PawStopperController:
         else:
             self.gpio.alarm_off()
             self.arduino.clear_buffer()
+            
+            # Enter scanning mode if no target detected
+            if not self.scanning_mode:
+                self.scanning_mode = True
+                logger.info("Entering scanning mode")
+            
+            self._perform_scan()
+    
+    def _perform_scan(self) -> None:
+        """Perform horizontal sweep scanning at different heights."""
+        try:
+            current_pan, current_tilt = self.position_tracker.get_position()
+            target_tilt = self.scan_height_levels[self.current_height_index]
+            
+            # Move to target height if not already there
+            if current_tilt != target_tilt:
+                tilt_delta = target_tilt - current_tilt
+                if self.position_tracker.is_within_limits(0, tilt_delta):
+                    self.arduino.send_absolute_position(current_pan, target_tilt)
+                    self.position_tracker.update_position(0, tilt_delta)
+                    time.sleep(0.2)
+                    return
+            
+            # Perform horizontal scan
+            pan_delta = self.scan_steps_per_move * self.scan_pan_direction
+            
+            if self.position_tracker.is_within_limits(pan_delta, 0):
+                new_pan = current_pan + pan_delta
+                self.arduino.send_absolute_position(new_pan, current_tilt)
+                self.position_tracker.update_position(pan_delta, 0)
+            else:
+                # Reached limit, change direction and move to next height
+                self.scan_pan_direction *= -1
+                self.current_height_index = (self.current_height_index + 1) % len(self.scan_height_levels)
+                logger.debug(f"Scan: Changed direction, height level: {self.current_height_index}")
+            
+            time.sleep(0.1)  # Small delay between scan steps
+            
+        except Exception as e:
+            logger.error(f"Error during scanning: {e}")
     
     def _find_first_detection(self, detections: List) -> Optional[tuple]:
         """Find the first detected object above threshold.
@@ -396,6 +597,17 @@ class PawStopperController:
         msg = self.arduino.read_message()
         if msg == "ALIGNED":
             return True
+        elif msg and msg.startswith("POS:"):
+            # Update position from Arduino feedback
+            try:
+                parts = msg.split(":")
+                if len(parts) == 2:
+                    pan, tilt = map(int, parts[1].split(","))
+                    self.position_tracker.pan_steps = pan
+                    self.position_tracker.tilt_steps = tilt
+                    self.position_tracker.save_position()
+            except ValueError:
+                logger.error(f"Invalid position feedback: {msg}")
         return False
     
     def _handle_aligned_target(self) -> None:
@@ -415,9 +627,16 @@ class PawStopperController:
                     
                 self.process_frame(frame)
                 
+                # Display scanning status
+                status_text = "SCANNING" if self.scanning_mode else "TRACKING"
+                cv2.putText(frame, status_text, (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+                
                 cv2.imshow("Output", frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
+                elif cv2.waitKey(1) & 0xFF == ord('h'):
+                    self.home_robot()
                     
         except KeyboardInterrupt:
             logger.info("Program interrupted by user")
