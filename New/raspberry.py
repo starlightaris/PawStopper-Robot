@@ -13,6 +13,8 @@ class StepperController:
         self.current_pos_y = 0
         self.tolerance = 15
         self.track_step_size = 5
+        self.is_homing = False
+        self.home_cooldown_active = False
         
     def send_step_command(self, axis, direction, steps):
         """Send step command to Arduino and wait for confirmation"""
@@ -68,6 +70,8 @@ class StepperController:
         """Return both axes to logical zero position"""
         print(f"Going home from position: ({self.current_pos_x}, {self.current_pos_y})")
         
+        self.is_homing = True
+        
         # Clear any pending data first
         self.arduino.reset_input_buffer()
         time.sleep(0.1)
@@ -122,13 +126,27 @@ class StepperController:
                 self.current_pos_y = 0
                 print("Y axis homed successfully")
         
+        self.is_homing = False
+        
         if home_success:
             print(f"Home complete. Final position: ({self.current_pos_x}, {self.current_pos_y})")
+            print("Starting 5-second home cooldown...")
+            # Start cooldown in a separate thread
+            threading.Thread(target=self._home_cooldown_thread, daemon=True).start()
         else:
             print("Homing failed! Position may be inaccurate.")
             print("Consider using manual_reset_position() if you know the actual position.")
-        
+
         return home_success
+    
+    def _home_cooldown_thread(self):
+        """Private method to handle home cooldown in a separate thread"""
+        self.home_cooldown_active = True
+        for i in range(5, 0, -1):
+            print(f"Home cooldown: {i} seconds remaining...")
+            time.sleep(1)
+        self.home_cooldown_active = False
+        print("Home cooldown complete. Ready to resume operations.")
     
     def track_object(self, frame_center, object_center):
         """Track object by calculating error and moving steppers accordingly"""
@@ -160,7 +178,23 @@ class StepperController:
     
     def scan_step(self, direction, step_size):
         """Perform one scan step"""
+        # Don't scan if homing or in cooldown
+        if self.is_homing or self.home_cooldown_active:
+            return False
         return self.step_x(direction, step_size)
+    
+    def is_ready_for_operations(self):
+        """Check if the stepper is ready for normal operations (not homing or in cooldown)"""
+        return not (self.is_homing or self.home_cooldown_active)
+    
+    def get_status(self):
+        """Get current status of the stepper controller"""
+        if self.is_homing:
+            return "HOMING"
+        elif self.home_cooldown_active:
+            return "HOME_COOLDOWN"
+        else:
+            return "READY"
     
     def get_position(self):
         """Get current position"""
@@ -193,7 +227,10 @@ class StepperController:
             'x_position': self.current_pos_x,
             'y_position': self.current_pos_y,
             'tolerance': self.tolerance,
-            'track_step_size': self.track_step_size
+            'track_step_size': self.track_step_size,
+            'status': self.get_status(),
+            'is_homing': self.is_homing,
+            'home_cooldown_active': self.home_cooldown_active
         }
 
 # Open serial port to Arduino
@@ -293,11 +330,15 @@ last_countdown_second = None
 def display_position_info(img, stepper):
     """Display current stepper position on the image"""
     pos_x, pos_y = stepper.get_position()
+    status = stepper.get_status()
+    
     cv2.putText(img, f"Pos: X={pos_x}, Y={pos_y}", (10, 30), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    cv2.putText(img, f"Tolerance: {stepper.tolerance}", (10, 55), 
+    cv2.putText(img, f"Status: {status}", (10, 55), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    cv2.putText(img, f"Tolerance: {stepper.tolerance}", (10, 80), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    cv2.putText(img, f"Step Size: {stepper.track_step_size}", (10, 75), 
+    cv2.putText(img, f"Step Size: {stepper.track_step_size}", (10, 100), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     
     # Add control instructions
@@ -376,16 +417,25 @@ if __name__ == "__main__":
                             scan_steps = 0
                 else:
                     # Passive scan mode using stepper controller
-                    if stepper.scan_step(scan_direction, scan_step_size):
-                        print(f"Scanning... Direction: {scan_direction}, Steps: {scan_step_size}")
-                        scan_steps += scan_step_size
+                    # Only scan if stepper is ready (not homing or in cooldown)
+                    if stepper.is_ready_for_operations():
+                        if stepper.scan_step(scan_direction, scan_step_size):
+                            print(f"Scanning... Direction: {scan_direction}, Steps: {scan_step_size}")
+                            scan_steps += scan_step_size
 
-                        if scan_steps >= scan_limit_steps:
-                            scan_direction = "BACKWARD" if scan_direction=="FORWARD" else "FORWARD"
-                            scan_steps = 0
-                            print(f"Scan direction changed to: {scan_direction}")
+                            if scan_steps >= scan_limit_steps:
+                                scan_direction = "BACKWARD" if scan_direction=="FORWARD" else "FORWARD"
+                                scan_steps = 0
+                                print(f"Scan direction changed to: {scan_direction}")
+                        else:
+                            print("Scan step failed, retrying...")
                     else:
-                        print("Scan step failed, retrying...")
+                        # Robot is homing or in cooldown, don't scan
+                        status = stepper.get_status()
+                        if status == "HOME_COOLDOWN":
+                            print("Waiting for home cooldown to complete...")
+                        elif status == "HOMING":
+                            print("Homing in progress...")
 
             cv2.imshow("Output", img)
             
