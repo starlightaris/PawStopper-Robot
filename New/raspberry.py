@@ -99,6 +99,18 @@ class StepperController:
     
     def go_home(self):
         """Return both axes to logical zero position"""
+        if self.is_homing:
+            print("Homing already in progress...")
+            return False
+        
+        print(f"Starting homing from position: ({self.current_pos_x}, {self.current_pos_y})")
+        
+        # Start homing in a separate thread to avoid blocking the main camera loop
+        threading.Thread(target=self._go_home_thread, daemon=True).start()
+        return True
+    
+    def _go_home_thread(self):
+        """Private method to handle homing in a separate thread"""
         print(f"Going home from position: ({self.current_pos_x}, {self.current_pos_y})")
         
         # Test connection first
@@ -263,10 +275,24 @@ class StepperController:
         return (self.current_pos_x, self.current_pos_y)
     
     def emergency_stop(self):
-        """Emergency stop - clear all buffers"""
+        """Emergency stop - clear all buffers and stop homing"""
+        self.is_homing = False
+        self.home_cooldown_active = False
         self.arduino.reset_input_buffer()
         self.arduino.reset_output_buffer()
         print("Emergency stop activated - buffers cleared")
+    
+    def force_go_home_sync(self):
+        """Force synchronous homing for shutdown - blocks until complete"""
+        if self.is_homing:
+            print("Waiting for current homing to complete...")
+            # Wait for homing to finish
+            while self.is_homing:
+                time.sleep(0.1)
+        
+        # Now do a quick synchronous home
+        print("Force homing for shutdown...")
+        self._go_home_thread()
     
     def set_tracking_parameters(self, tolerance=None, step_size=None):
         """Update tracking parameters"""
@@ -505,14 +531,14 @@ if __name__ == "__main__":
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 print("[INFO] Quitting. Sending robot to home position.")
-                stepper.go_home()
+                stepper.force_go_home_sync()  # Use synchronous version for shutdown
                 break
             elif key == ord('r'):  # Reset position to (0,0)
                 print("[INFO] Manually resetting position to (0,0)")
                 stepper.manual_reset_position(0, 0)
             elif key == ord('h'):  # Go home
                 print("[INFO] Manual home command")
-                stepper.go_home()
+                stepper.go_home()  # Use async version during operation
             elif key == ord('p'):  # Print position info
                 info = stepper.get_position_info()
                 print(f"[INFO] Current position info: {info}")
@@ -520,7 +546,7 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
         print("Interrupted by user")
-        stepper.go_home()
+        stepper.force_go_home_sync()  # Use synchronous version for shutdown
     finally:
         print("Cleaning up...")
         stepper.emergency_stop()
