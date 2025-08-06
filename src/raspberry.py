@@ -74,18 +74,13 @@ COOLDOWN_SECONDS = 10
 last_trigger_time = 0
 
 scan_direction = "FORWARD"
-scan_limit_steps = 100
+scan_limit_steps = 1024 #1024 for 180 degree
 scan_steps = 0
-scan_step_size = 5
+scan_step_size = 10 # 10 is smoother
 
 # Cooldown before going home after losing object
 home_cooldown = 5  # seconds
 lost_since = None
-
-# File save state
-last_save_time = 0
-save_interval = 10  # seconds
-scan_info_file = "/home/eutech/Desktop/PawStopper-Robot/scan_info.txt"
 
 if __name__ == "__main__":
     cap = cv2.VideoCapture(0)
@@ -102,7 +97,7 @@ if __name__ == "__main__":
             frame_center = (frame_width//2, frame_height//2)
             cv2.circle(img, frame_center, 6, (0,0,255), -1)  # Red center dot
 
-            result, objectInfo = getObjects(img,0.45,0.2,objects=['cup'])  # change object name here
+            result, objectInfo = getObjects(img,0.45,0.2,objects=['cell_phone'])  # change object name here
 
             biggest_box = None
             max_area = 0
@@ -161,19 +156,19 @@ if __name__ == "__main__":
                     print(f"Scanning... Sent: {step_cmd.strip()}")
                     scan_steps += scan_step_size
 
-                    # Save scan state every 10s
-                    if current_time - last_save_time > save_interval:
-                        with open(scan_info_file, "w") as f:
-                            f.write(f"{scan_direction},{scan_steps}\n")
-                        print(f"[INFO] Saved scan position: Direction={scan_direction} Steps={scan_steps}")
-                        last_save_time = current_time
-
                     if scan_steps >= scan_limit_steps:
                         scan_direction = "BACKWARD" if scan_direction=="FORWARD" else "FORWARD"
                         scan_steps = 0
 
             cv2.imshow("Output", img)
-            if cv2.waitKey(1)&0xFF == ord('q'): break
+            #if cv2.waitKey(1)&0xFF == ord('q'): break
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("[INFO] Quitting. Sending robot to home position.")
+                arduino.write(b'HOME\n')
+                time.sleep(2)  # wait for Arduino to complete movement
+                break
+
 
     except KeyboardInterrupt:
         print("Interrupted by user")
