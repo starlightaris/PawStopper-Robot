@@ -1,19 +1,17 @@
 """
-PawStopper Robot Control System
-This module implements the main control system for the PawStopper robot,
-integrating camera feed, object detection, and hardware control components.
+PawStopper Robot - Automated Pet Deterrent System
+Main control module for Raspberry Pi with Arduino stepper motor communication
 """
 
+# Imports
 import cv2
 import RPi.GPIO as GPIO
 import serial
 import time
 import threading
 import logging
-import json
-import os
-from datetime import datetime
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Dict, Optional, Any
+from dataclasses import dataclass
 
 # Configure logging
 logging.basicConfig(
@@ -23,638 +21,817 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration Constants
-SERIAL_PORT = '/dev/ttyUSB0'
-SERIAL_BAUDRATE = 9600
-SERIAL_TIMEOUT = 1
-
-# Motor limits (in steps)
-PAN_LIMIT_STEPS = 100   # ±90 degrees (200 steps = 360°, so 100 steps = 180°)
-TILT_LIMIT_STEPS = 25   # ±45 degrees (200 steps = 360°, so 25 steps = 45°)
-
-# Position tracking file
-POSITION_FILE = "position_state.json"
-
-class ArduinoCommunicator:
-    """Handles serial communication with the Arduino."""
+@dataclass
+class Config:
+    """Configuration settings for the PawStopper robot"""
     
-    def __init__(self, port: str = SERIAL_PORT, baudrate: int = SERIAL_BAUDRATE, timeout: int = SERIAL_TIMEOUT):
-        """Initialize the Arduino communication."""
-        try:
-            self.arduino = serial.Serial(port, baudrate, timeout=timeout)
-            time.sleep(2)  # Wait for Arduino to reset
-            logger.info("Arduino connection established successfully")
-        except serial.SerialException as e:
-            logger.error(f"Failed to connect to Arduino: {e}")
-            raise
+    # Serial Communication
+    ARDUINO_PORT: str = '/dev/ttyUSB0'
+    ARDUINO_BAUDRATE: int = 9600
+    SERIAL_TIMEOUT: float = 1.0
+    COMMAND_TIMEOUT: float = 3.0
+    
+    # GPIO Pins
+    RELAY_PIN: int = 17
+    ALARM_PIN: int = 18
+    
+    # Stepper Motor Settings
+    DEFAULT_TOLERANCE: int = 25  # Increased from 15 to reduce oscillation
+    DEFAULT_TRACK_STEP_SIZE: int = 5
+    MAX_CHUNK_SIZE: int = 50
+    MAX_RETRIES: int = 3
+    
+    # Scanning Parameters
+    SCAN_LIMIT_STEPS: int = 1024  # 180 degrees
+    SCAN_STEP_SIZE: int = 10 # Number of steps per scan
+    
+    # Object Detection
+    AREA_THRESHOLD: int = 15000
+    CONFIDENCE_THRESHOLD: float = 0.45
+    NMS_THRESHOLD: float = 0.2
+    TARGET_OBJECTS: List[str] = None
+    
+    # Timing
+    RELAY_DURATION: int = 5
+    COOLDOWN_SECONDS: int = 10
+    HOME_COOLDOWN_SECONDS: int = 5
+    LOST_OBJECT_TIMEOUT: int = 5
+    
+    # Camera Settings
+    CAMERA_WIDTH: int = 640
+    CAMERA_HEIGHT: int = 480
+    INPUT_SIZE: Tuple[int, int] = (320, 320)
+    
+    # File Paths
+    COCO_NAMES_PATH: str = "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/coco.names"
+    MODEL_PATH: str = "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/frozen_inference_graph.pb"
+    CONFIG_PATH: str = "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/ssd_mobilenet_v3_large_coco_2020_01_14.pbtxt"
+    
+    def __post_init__(self):
+        if self.TARGET_OBJECTS is None:
+            self.TARGET_OBJECTS = ['cell phone'] # change object here to cat, dog
 
-    def send_coordinates(self, center_frame: Tuple[int, int], center_object: Tuple[int, int]) -> None:
-        """Send coordinate data to Arduino.
+class StepperController:
+    """Handles stepper motor control and position tracking"""
+    
+    def __init__(self, arduino_serial: serial.Serial, config: Config):
+        self.arduino = arduino_serial
+        self.config = config
+        self.current_pos_x: int = 0
+        self.current_pos_y: int = 0
+        self.tolerance: int = config.DEFAULT_TOLERANCE
+        self.track_step_size: int = config.DEFAULT_TRACK_STEP_SIZE
+        self.is_homing: bool = False
+        self.home_cooldown_active: bool = False
+        self._lock = threading.Lock()
+        self._homing_complete_event = threading.Event()
         
-        Args:
-            center_frame: Tuple of (x, y) coordinates for frame center
-            center_object: Tuple of (x, y) coordinates for object center
-        """
-        try:
-            data = f"{center_frame[0]},{center_frame[1]},{center_object[0]},{center_object[1]}\n"
-            self.arduino.write(data.encode())
-            logger.info(f"Sent to Arduino: {data.strip()}")
-        except serial.SerialException as e:
-            logger.error(f"Failed to send coordinates to Arduino: {e}")
-    
-    def send_scan_command(self) -> None:
-        """Send scan command to Arduino."""
-        try:
-            self.arduino.write(b'SCAN\n')
-            logger.debug("Scan command sent to Arduino")
-        except serial.SerialException as e:
-            logger.error(f"Failed to send scan command: {e}")
-    
-    def send_home_command(self) -> None:
-        """Send home command to Arduino."""
-        try:
-            self.arduino.write(b'HOME\n')
-            logger.info("Home command sent to Arduino")
-        except serial.SerialException as e:
-            logger.error(f"Failed to send home command: {e}")
-    
-    def send_absolute_position(self, pan_steps: int, tilt_steps: int) -> None:
-        """Send absolute position command to Arduino.
+    def send_step_command(self, axis: str, direction: str, steps: int) -> bool:
+        """Send step command to Arduino and wait for confirmation"""
+        cmd = f"STEP {axis} {direction} {steps}\n"
         
-        Args:
-            pan_steps: Target pan position in steps
-            tilt_steps: Target tilt position in steps
-        """
         try:
-            data = f"POS,{pan_steps},{tilt_steps}\n"
-            self.arduino.write(data.encode())
-            logger.info(f"Position command sent: {data.strip()}")
-        except serial.SerialException as e:
-            logger.error(f"Failed to send position command: {e}")
+            with self._lock:
+                # Clear any pending data before sending command
+                self.arduino.reset_input_buffer()
+                time.sleep(0.1)  # Increased delay
+                
+                self.arduino.write(cmd.encode())
+                self.arduino.flush()  # Ensure data is sent
+                logger.debug(f"Sent: {cmd.strip()}")
+                
+                # Wait for acknowledgment with better timeout handling
+                start_time = time.time()
+                responses_received = []
+                
+                while time.time() - start_time < self.config.COMMAND_TIMEOUT:
+                    if self.arduino.in_waiting > 0:
+                        try:
+                            response = self.arduino.readline().decode().strip()
+                            if response:  # Only process non-empty responses
+                                responses_received.append(response)
+                                logger.debug(f"Arduino response: '{response}'")
+                                
+                                if response == f"{axis}_OK":
+                                    return True
+                                elif response.endswith("_ERROR"):
+                                    logger.error(f"Arduino reported error: {response}")
+                                    return False
+                        except UnicodeDecodeError:
+                            logger.warning("Received malformed data from Arduino")
+                            continue
+                    time.sleep(0.01)
+                
+                logger.error(f"Timeout waiting for {axis}_OK acknowledgment")
+                logger.debug(f"All responses received: {responses_received}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error sending step command: {e}")
+            return False
     
-    def read_message(self) -> Optional[str]:
-        """Read a message from Arduino.
-        
-        Returns:
-            The decoded message or None if no message available
-        """
-        try:
-            if self.arduino.in_waiting > 0:
-                return self.arduino.readline().decode().strip()
-            return None
-        except serial.SerialException as e:
-            logger.error(f"Failed to read from Arduino: {e}")
-            return None
-    
-    def clear_buffer(self) -> None:
-        """Clear the input buffer."""
-        try:
-            self.arduino.reset_input_buffer()
-        except serial.SerialException as e:
-            logger.error(f"Failed to clear Arduino buffer: {e}")
-
-    def close(self) -> None:
-        """Close the serial connection."""
-        try:
-            self.arduino.close()
-            logger.info("Arduino connection closed")
-        except serial.SerialException as e:
-            logger.error(f"Error closing Arduino connection: {e}")
-
-
-class PositionTracker:
-    """Tracks and manages robot position state."""
-    
-    def __init__(self, position_file: str = POSITION_FILE):
-        """Initialize position tracker.
-        
-        Args:
-            position_file: Path to position state file
-        """
-        self.position_file = position_file
-        self.pan_steps = 0
-        self.tilt_steps = 0
-        self.load_position()
-    
-    def load_position(self) -> None:
-        """Load position from file or create new if doesn't exist."""
-        try:
-            if os.path.exists(self.position_file):
-                with open(self.position_file, 'r') as f:
-                    data = json.load(f)
-                    self.pan_steps = data.get('pan_steps', 0)
-                    self.tilt_steps = data.get('tilt_steps', 0)
-                    logger.info(f"Position loaded: Pan={self.pan_steps}, Tilt={self.tilt_steps}")
+    def _update_position(self, axis: str, direction: str, steps: int) -> None:
+        """Update position tracking after successful movement"""
+        if axis == "X":
+            old_pos = self.current_pos_x
+            if direction == "FORWARD":
+                self.current_pos_x += steps
             else:
-                self.save_position()
-                logger.info("Position file created with default values")
-        except Exception as e:
-            logger.error(f"Error loading position: {e}")
-            self.pan_steps = 0
-            self.tilt_steps = 0
+                self.current_pos_x -= steps
+            logger.debug(f"X position updated: {old_pos} -> {self.current_pos_x}")
+        elif axis == "Y":
+            old_pos = self.current_pos_y
+            if direction == "FORWARD":
+                self.current_pos_y += steps
+            else:
+                self.current_pos_y -= steps
+            logger.debug(f"Y position updated: {old_pos} -> {self.current_pos_y}")
     
-    def save_position(self) -> None:
-        """Save current position to file."""
+    def step_x(self, direction: str, steps: int) -> bool:
+        """Move X axis and update position tracking"""
+        logger.debug(f"Moving X axis: {direction} {steps} steps. Current pos: {self.current_pos_x}")
+        if self.send_step_command("X", direction, steps):
+            self._update_position("X", direction, steps)
+            return True
+        else:
+            logger.error("X step command failed - position not updated")
+            return False
+    
+    def step_y(self, direction: str, steps: int) -> bool:
+        """Move Y axis and update position tracking"""
+        logger.debug(f"Moving Y axis: {direction} {steps} steps. Current pos: {self.current_pos_y}")
+        if self.send_step_command("Y", direction, steps):
+            self._update_position("Y", direction, steps)
+            return True
+        else:
+            logger.error("Y step command failed - position not updated")
+            return False
+    
+    def test_connection(self) -> bool:
+        """Test Arduino connection with a simple command"""
+        logger.info("Testing Arduino connection...")
+        
+        test_success = self.send_step_command("X", "FORWARD", 1)
+        if test_success:
+            logger.info("Connection test successful!")
+            self.send_step_command("X", "BACKWARD", 1)
+            return True
+        else:
+            logger.error("Connection test failed!")
+            return False
+    
+    def go_home(self) -> bool:
+        """Return both axes to logical zero position (async)"""
+        if self.is_homing:
+            logger.warning("Homing already in progress...")
+            return False
+        
+        logger.info(f"Starting homing from position: ({self.current_pos_x}, {self.current_pos_y})")
+        self._homing_complete_event.clear()
+        threading.Thread(target=self._go_home_thread, daemon=True).start()
+        return True
+    
+    def wait_for_homing_complete(self, timeout: float = 30.0) -> bool:
+        """Wait for homing to complete with timeout"""
+        return self._homing_complete_event.wait(timeout)
+    
+    def _go_home_thread(self) -> bool:
+        """Private method to handle homing in a separate thread"""
+        logger.info(f"Going home from position: ({self.current_pos_x}, {self.current_pos_y})")
+        
+        self.is_homing = True
+        home_success = True
+        
         try:
-            data = {
-                'pan_steps': self.pan_steps,
-                'tilt_steps': self.tilt_steps,
-                'last_updated': datetime.now().isoformat()
-            }
-            with open(self.position_file, 'w') as f:
-                json.dump(data, f, indent=2)
-            logger.debug(f"Position saved: Pan={self.pan_steps}, Tilt={self.tilt_steps}")
-        except Exception as e:
-            logger.error(f"Error saving position: {e}")
-    
-    def update_position(self, pan_delta: int, tilt_delta: int) -> None:
-        """Update position by delta steps.
-        
-        Args:
-            pan_delta: Change in pan steps
-            tilt_delta: Change in tilt steps
-        """
-        self.pan_steps = max(-PAN_LIMIT_STEPS, min(PAN_LIMIT_STEPS, self.pan_steps + pan_delta))
-        self.tilt_steps = max(-TILT_LIMIT_STEPS, min(TILT_LIMIT_STEPS, self.tilt_steps + tilt_delta))
-        self.save_position()
-    
-    def reset_to_center(self) -> Tuple[int, int]:
-        """Reset position to center and return steps needed.
-        
-        Returns:
-            Tuple of (pan_steps_to_center, tilt_steps_to_center)
-        """
-        pan_to_center = -self.pan_steps
-        tilt_to_center = -self.tilt_steps
-        
-        self.pan_steps = 0
-        self.tilt_steps = 0
-        self.save_position()
-        
-        logger.info(f"Reset to center: Pan={pan_to_center}, Tilt={tilt_to_center}")
-        return pan_to_center, tilt_to_center
-    
-    def is_within_limits(self, pan_delta: int, tilt_delta: int) -> bool:
-        """Check if movement would exceed limits.
-        
-        Args:
-            pan_delta: Proposed pan movement
-            tilt_delta: Proposed tilt movement
+            # Test connection before starting
+            if not self.test_connection():
+                logger.error("Cannot proceed with homing - Arduino communication failed")
+                home_success = False
+                return False
             
-        Returns:
-            True if movement is within limits
-        """
-        new_pan = self.pan_steps + pan_delta
-        new_tilt = self.tilt_steps + tilt_delta
+            # Clear any pending data
+            with self._lock:
+                self.arduino.reset_input_buffer()
+                time.sleep(0.2)
+            
+            # Home Y axis first (usually safer)
+            if self.current_pos_y != 0:
+                logger.info("Homing Y axis first...")
+                home_success = self._home_axis("Y", self.current_pos_y)
+                if not home_success:
+                    logger.error("Y axis homing failed!")
+                    return False
+                time.sleep(0.5)  # Pause between axes
+            
+            # Then home X axis
+            if self.current_pos_x != 0:
+                logger.info("Homing X axis...")
+                home_success = self._home_axis("X", self.current_pos_x)
+                if not home_success:
+                    logger.error("X axis homing failed!")
+                    return False
+            
+            if home_success:
+                logger.info(f"Home complete. Final position: ({self.current_pos_x}, {self.current_pos_y})")
+                threading.Thread(target=self._home_cooldown_thread, daemon=True).start()
+            else:
+                logger.error("Homing failed! Position may be inaccurate.")
+                
+        except Exception as e:
+            logger.error(f"Exception during homing: {e}")
+            home_success = False
+        finally:
+            self.is_homing = False
+            self._homing_complete_event.set()
+            
+        return home_success
+    
+    def _home_axis(self, axis: str, current_pos: int) -> bool:
+        """Home a single axis with chunked movement and retry logic"""
+        direction = "BACKWARD" if current_pos > 0 else "FORWARD"
+        steps = abs(current_pos)
+        logger.info(f"Homing {axis} axis: {steps} steps {direction}")
         
-        return (-PAN_LIMIT_STEPS <= new_pan <= PAN_LIMIT_STEPS and 
-                -TILT_LIMIT_STEPS <= new_tilt <= TILT_LIMIT_STEPS)
+        remaining_steps = steps
+        retry_count = 0
+        consecutive_failures = 0
+        
+        while remaining_steps > 0 and retry_count < self.config.MAX_RETRIES:
+            chunk_steps = min(remaining_steps, self.config.MAX_CHUNK_SIZE)
+            logger.debug(f"Attempting {axis} movement: {chunk_steps} steps {direction} (attempt {retry_count + 1})")
+            
+            if axis == "X":
+                success = self.step_x(direction, chunk_steps)
+            else:
+                success = self.step_y(direction, chunk_steps)
+                
+            if success:
+                remaining_steps -= chunk_steps
+                retry_count = 0
+                consecutive_failures = 0
+                logger.debug(f"{axis} homing progress: {steps - remaining_steps}/{steps} steps")
+                time.sleep(0.1)  # Small delay between successful moves
+            else:
+                retry_count += 1
+                consecutive_failures += 1
+                logger.warning(f"{axis} step failed! Retry {retry_count}/{self.config.MAX_RETRIES}")
+                
+                if consecutive_failures >= 2:
+                    # Try to reset communication
+                    logger.warning("Multiple consecutive failures, resetting communication...")
+                    time.sleep(0.5)
+                    with self._lock:
+                        self.arduino.reset_input_buffer()
+                        self.arduino.reset_output_buffer()
+                    time.sleep(0.5)
+                    
+                if retry_count >= self.config.MAX_RETRIES:
+                    logger.error(f"{axis} homing failed after maximum retries!")
+                    return False
+                    
+                time.sleep(0.5)  # Wait before retry
+        
+        if remaining_steps == 0:
+            # Verify position is actually zero
+            if axis == "X":
+                self.current_pos_x = 0
+            else:
+                self.current_pos_y = 0
+            logger.info(f"{axis} axis homed successfully")
+            return True
+        else:
+            logger.error(f"{axis} homing incomplete! {remaining_steps} steps remaining")
+            return False
+    
+    def _home_cooldown_thread(self) -> None:
+        """Handle home cooldown in a separate thread"""
+        self.home_cooldown_active = True
+        logger.info(f"Starting {self.config.HOME_COOLDOWN_SECONDS}-second home cooldown...")
+        
+        for i in range(self.config.HOME_COOLDOWN_SECONDS, 0, -1):
+            logger.debug(f"Home cooldown: {i} seconds remaining...")
+            time.sleep(1)
+            
+        self.home_cooldown_active = False
+        logger.info("Home cooldown complete. Ready to resume operations.")
+    
+    def track_object(self, frame_center: Tuple[int, int], object_center: Tuple[int, int]) -> Tuple[bool, bool]:
+        """Track object by calculating error and moving steppers accordingly"""
+        error_x = frame_center[0] - object_center[0]
+        error_y = frame_center[1] - object_center[1]
+        
+        logger.debug(f"ErrorX: {error_x}, ErrorY: {error_y}")
+        
+        moved = False
+        
+        # Calculate proportional step size - smaller steps as we get closer
+        # Min of 1 step, max of track_step_size
+        def calculate_step_size(error, axis):
+            # Calculate a proportional step based on error magnitude
+            # Larger errors = larger steps, smaller errors = smaller steps
+            abs_error = abs(error)
+            if abs_error <= self.tolerance:
+                return 0
+            
+            # Scale factor to reduce step size as we get closer
+            if abs_error > 100:
+                proportion = 1.0  # Full step size for large errors
+            else:
+                proportion = abs_error / 100.0  # Proportionally smaller steps
+                
+            # Ensure minimum step of 1, maximum of track_step_size
+            step = max(1, min(round(self.track_step_size * proportion), self.track_step_size))
+            logger.debug(f"{axis} error: {error}, calculated step: {step}")
+            return step
+        
+        # Move X axis if error is above tolerance with proportional step size
+        x_step_size = calculate_step_size(error_x, "X")
+        if x_step_size > 0:
+            direction = "FORWARD" if error_x > 0 else "BACKWARD"
+            if self.step_x(direction, x_step_size):
+                moved = True
+                time.sleep(0.05)  # Small delay after movement to stabilize
+        
+        # Move Y axis if error is above tolerance with proportional step size
+        y_step_size = calculate_step_size(error_y, "Y")
+        if y_step_size > 0:
+            direction = "FORWARD" if error_y > 0 else "BACKWARD"
+            if self.step_y(direction, y_step_size):
+                moved = True
+                time.sleep(0.05)  # Small delay after movement to stabilize
+        
+        # Check if aligned
+        aligned = abs(error_x) <= self.tolerance and abs(error_y) <= self.tolerance
+        if aligned:
+            logger.debug("ALIGNED")
+        elif moved:
+            # If we made movements, give a brief pause to let the system stabilize
+            time.sleep(0.1)
+            
+        return aligned, moved
+    
+    def scan_step(self, direction: str, step_size: int) -> bool:
+        """Perform one scan step if ready"""
+        if not self.is_ready_for_operations():
+            return False
+        return self.step_x(direction, step_size)
+    
+    def is_ready_for_operations(self) -> bool:
+        """Check if the stepper is ready for normal operations"""
+        return not (self.is_homing or self.home_cooldown_active)
+    
+    def get_status(self) -> str:
+        """Get current status of the stepper controller"""
+        if self.is_homing:
+            return "HOMING"
+        elif self.home_cooldown_active:
+            return "HOME_COOLDOWN"
+        else:
+            return "READY"
     
     def get_position(self) -> Tuple[int, int]:
-        """Get current position.
-        
-        Returns:
-            Tuple of (pan_steps, tilt_steps)
-        """
-        return self.pan_steps, self.tilt_steps
-
-
-class GPIOController:
-    """Controls GPIO components including relay and alarm."""
+        """Get current position"""
+        return (self.current_pos_x, self.current_pos_y)
     
-    def __init__(self, relay_pin: int = 17, alarm_pin: int = 18):
-        """Initialize GPIO controller.
+    def emergency_stop(self) -> None:
+        """Emergency stop - clear all buffers and stop homing"""
+        self.is_homing = False
+        self.home_cooldown_active = False
+        with self._lock:
+            self.arduino.reset_input_buffer()
+            self.arduino.reset_output_buffer()
+        logger.warning("Emergency stop activated - buffers cleared")
+    
+    def force_go_home_sync(self) -> None:
+        """Force synchronous homing for shutdown - blocks until complete"""
+        if self.is_homing:
+            logger.info("Waiting for current homing to complete...")
+            if not self.wait_for_homing_complete(30.0):
+                logger.warning("Timeout waiting for homing to complete, forcing stop...")
+                self.emergency_stop()
+                time.sleep(1)
         
-        Args:
-            relay_pin: GPIO pin number for relay
-            alarm_pin: GPIO pin number for alarm
-        """
-        self.relay_pin = relay_pin
-        self.alarm_pin = alarm_pin
-        
-        GPIO.setmode(GPIO.BCM)
+        logger.info("Force homing for shutdown...")
+        self.is_homing = True
+        try:
+            self._go_home_thread()
+        finally:
+            self.is_homing = False
+
+    def set_tracking_parameters(self, tolerance: Optional[int] = None, step_size: Optional[int] = None) -> None:
+        """Update tracking parameters"""
+        if tolerance is not None:
+            self.tolerance = tolerance
+            logger.info(f"Tolerance updated to: {self.tolerance}")
+        if step_size is not None:
+            self.track_step_size = step_size
+            logger.info(f"Tracking step size updated to: {self.track_step_size}")
+    
+    def manual_reset_position(self, x: int = 0, y: int = 0) -> None:
+        """Manually reset position counters"""
+        self.current_pos_x = x
+        self.current_pos_y = y
+        logger.info(f"Position manually reset to: ({x}, {y})")
+    
+    def get_position_info(self) -> Dict[str, Any]:
+        """Get detailed position information"""
+        return {
+            'x_position': self.current_pos_x,
+            'y_position': self.current_pos_y,
+            'tolerance': self.tolerance,
+            'track_step_size': self.track_step_size,
+            'status': self.get_status(),
+            'is_homing': self.is_homing,
+            'home_cooldown_active': self.home_cooldown_active
+        }
+
+class RelayController:
+    """Handles relay control for the deterrent mechanism"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.relay_pin = config.RELAY_PIN
         GPIO.setup(self.relay_pin, GPIO.OUT)
-        GPIO.setup(self.alarm_pin, GPIO.OUT)
         GPIO.output(self.relay_pin, GPIO.HIGH)  # Initially off
         
-        logger.info("GPIO components initialized")
-    
-    def trigger_relay(self, duration: float = 5) -> None:
-        """Trigger the relay for a specified duration.
-        
-        Args:
-            duration: Time in seconds to keep the relay on
-        """
+    def trigger_relay(self, duration: int = None) -> None:
+        """Trigger relay for specified duration"""
+        if duration is None:
+            duration = self.config.RELAY_DURATION
+            
         logger.info("Relay ON")
         GPIO.output(self.relay_pin, GPIO.LOW)
         time.sleep(duration)
         GPIO.output(self.relay_pin, GPIO.HIGH)
         logger.info("Relay OFF")
     
-    def trigger_relay_async(self, duration: float = 5) -> None:
-        """Trigger the relay asynchronously.
-        
-        Args:
-            duration: Time in seconds to keep the relay on
-        """
-        threading.Thread(
-            target=self.trigger_relay,
-            args=(duration,),
-            daemon=True
-        ).start()
-    
-    def alarm_on(self) -> None:
-        """Turn on the alarm."""
-        GPIO.output(self.alarm_pin, GPIO.HIGH)
-    
-    def alarm_off(self) -> None:
-        """Turn off the alarm."""
-        GPIO.output(self.alarm_pin, GPIO.LOW)
-    
-    def cleanup(self) -> None:
-        """Clean up GPIO resources."""
-        GPIO.cleanup()
-        logger.info("GPIO cleanup completed")
+    def trigger_relay_async(self, duration: int = None) -> None:
+        """Trigger relay asynchronously"""
+        if duration is None:
+            duration = self.config.RELAY_DURATION
+        threading.Thread(target=self.trigger_relay, args=(duration,), daemon=True).start()
 
-# Model paths configuration
-MODEL_CONFIG = {
-    'COCO_NAMES': "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/coco.names",
-    'CONFIG_PATH': "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/ssd_mobilenet_v3_large_coco_2020_01_14.pbtxt",
-    'WEIGHTS_PATH': "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/frozen_inference_graph.pb"
-}
+class AlarmController:
+    """Handles alarm system control"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.alarm_pin = config.ALARM_PIN
+        GPIO.setup(self.alarm_pin, GPIO.OUT)
+        
+    def alarm_on(self) -> None:
+        """Turn alarm on"""
+        GPIO.output(self.alarm_pin, GPIO.HIGH)
+        
+    def alarm_off(self) -> None:
+        """Turn alarm off"""
+        GPIO.output(self.alarm_pin, GPIO.LOW)
 
 class ObjectDetector:
-    """Handles object detection using OpenCV DNN model."""
+    """Handles object detection using OpenCV DNN"""
     
-    def __init__(self, config_path: str, weights_path: str, names_path: str):
-        """Initialize the object detector.
+    def __init__(self, config: Config):
+        self.config = config
+        self.class_names = self._load_class_names()
+        self.net = self._initialize_model()
         
-        Args:
-            config_path: Path to model configuration file
-            weights_path: Path to model weights file
-            names_path: Path to class names file
-        """
-        self.load_class_names(names_path)
-        self.initialize_model(config_path, weights_path)
-        logger.info("Object detector initialized successfully")
-    
-    def load_class_names(self, names_path: str) -> None:
-        """Load class names from file.
-        
-        Args:
-            names_path: Path to the class names file
-        """
+    def _load_class_names(self) -> List[str]:
+        """Load class names from coco.names file"""
         try:
-            with open(names_path, "rt") as f:
-                self.class_names = f.read().rstrip("\n").split("\n")
-            logger.info(f"Loaded {len(self.class_names)} class names")
+            with open(self.config.COCO_NAMES_PATH, "rt") as f:
+                return f.read().rstrip("\n").split("\n")
         except FileNotFoundError:
-            logger.error(f"Class names file not found: {names_path}")
-            raise
+            logger.error(f"Class names file not found: {self.config.COCO_NAMES_PATH}")
+            return []
     
-    def initialize_model(self, config_path: str, weights_path: str) -> None:
-        """Initialize the DNN model.
-        
-        Args:
-            config_path: Path to model configuration
-            weights_path: Path to model weights
-        """
+    def _initialize_model(self) -> cv2.dnn_DetectionModel:
+        """Initialize the detection model"""
         try:
-            self.net = cv2.dnn_DetectionModel(weights_path, config_path)
-            self.net.setInputSize(320, 320)
-            self.net.setInputScale(1.0 / 127.5)
-            self.net.setInputMean((127.5, 127.5, 127.5))
-            self.net.setInputSwapRB(True)
+            net = cv2.dnn_DetectionModel(self.config.MODEL_PATH, self.config.CONFIG_PATH)
+            net.setInputSize(*self.config.INPUT_SIZE)
+            net.setInputScale(1.0/127.5)
+            net.setInputMean((127.5, 127.5, 127.5))
+            net.setInputSwapRB(True)
+            logger.info("Object detection model initialized successfully")
+            return net
         except Exception as e:
-            logger.error(f"Failed to initialize model: {e}")
+            logger.error(f"Failed to initialize detection model: {e}")
             raise
     
-    def detect_objects(self, img: np.ndarray, 
-                      threshold: float = 0.45, 
-                      nms_threshold: float = 0.2, 
-                      draw: bool = True,
-                      target_objects: Optional[List[str]] = None) -> Tuple[np.ndarray, List]:
-        """Detect objects in the image and optionally draw bounding boxes.
-        
-        Args:
-            img: Input image
-            threshold: Confidence threshold for detection
-            nms_threshold: Non-maximum suppression threshold
-            draw: Whether to draw detection results on image
-            target_objects: List of specific objects to detect
-        
-        Returns:
-            Tuple of (annotated image, list of detected objects)
-        """
-        target_objects = target_objects or self.class_names
-        object_info = []
-        
+    def detect_objects(self, img, draw: bool = True, target_objects: List[str] = None) -> Tuple[Any, List[List]]:
+        """Detect objects and mark centers"""
+        if target_objects is None:
+            target_objects = self.config.TARGET_OBJECTS
+            
         try:
-            class_ids, confidences, boxes = self.net.detect(
+            classIds, confs, bbox = self.net.detect(
                 img, 
-                confThreshold=threshold, 
-                nmsThreshold=nms_threshold
+                confThreshold=self.config.CONFIDENCE_THRESHOLD, 
+                nmsThreshold=self.config.NMS_THRESHOLD
             )
             
-            if len(class_ids) != 0:
-                for class_id, confidence, box in zip(
-                    class_ids.flatten(), 
-                    confidences.flatten(), 
-                    boxes
-                ):
-                    class_name = self.class_names[class_id - 1]
-                    if class_name in target_objects:
-                        center_x = box[0] + box[2] // 2
-                        center_y = box[1] + box[3] // 2
-                        
-                        object_info.append([
-                            box,
-                            class_name,
-                            round(confidence * 100, 2),
-                            (center_x, center_y)
-                        ])
-                        
-                        if draw:
-                            self._draw_detection(
-                                img, 
-                                box, 
-                                class_name, 
-                                confidence,
-                                (center_x, center_y)
-                            )
+            object_info = []
+            
+            if len(classIds) != 0:
+                for classId, confidence, box in zip(classIds.flatten(), confs.flatten(), bbox):
+                    if classId - 1 < len(self.class_names):
+                        className = self.class_names[classId - 1]
+                        if className in target_objects:
+                            center = (box[0] + box[2]//2, box[1] + box[3]//2)
+                            object_info.append([box, className, round(confidence*100, 2), center])
+                            
+                            if draw:
+                                cv2.rectangle(img, box, (0, 255, 0), 2)
+                                cv2.putText(img, f"{className.upper()} {round(confidence*100, 2)}%", 
+                                           (box[0]+10, box[1]+30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                                cv2.circle(img, center, 5, (0, 255, 0), -1)
             
             return img, object_info
             
         except Exception as e:
-            logger.error(f"Error during object detection: {e}")
+            logger.error(f"Object detection failed: {e}")
             return img, []
-    
-    def _draw_detection(self, img: np.ndarray, 
-                       box: tuple, 
-                       class_name: str, 
-                       confidence: float,
-                       center: Tuple[int, int]) -> None:
-        """Draw detection results on the image.
-        
-        Args:
-            img: Image to draw on
-            box: Bounding box coordinates
-            class_name: Name of detected class
-            confidence: Detection confidence
-            center: Center point coordinates
-        """
-        cv2.rectangle(img, box, color=(0, 255, 0), thickness=2)
-        cv2.putText(img, class_name.upper(), (box[0]+10, box[1]+30),
-                    cv2.FONT_HERSHEY_COMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(img, f"{round(confidence * 100, 2)}%", 
-                    (box[0]+200, box[1]+30),
-                    cv2.FONT_HERSHEY_COMPLEX, 1, (0, 255, 0), 2)
-        cv2.circle(img, center, radius=5, color=(0, 255, 0), thickness=-1)
 
-
-class CameraController:
-    """Manages camera operations and frame processing."""
+class ScanController:
+    """Handles scanning behavior when no object is tracked"""
     
-    def __init__(self, camera_id: int = 0, width: int = 640, height: int = 480):
-        """Initialize camera controller.
+    def __init__(self, config: Config, stepper: StepperController):
+        self.config = config
+        self.stepper = stepper
+        self.scan_direction = "FORWARD"
+        self.scan_steps = 0
         
-        Args:
-            camera_id: Camera device ID
-            width: Frame width
-            height: Frame height
-        """
-        self.cap = cv2.VideoCapture(camera_id)
-        self.cap.set(3, width)
-        self.cap.set(4, height)
-        
-        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.frame_center = (self.frame_width // 2, self.frame_height // 2)
-        
-        logger.info(f"Camera initialized: {self.frame_width}x{self.frame_height}")
-    
-    def read_frame(self) -> Tuple[bool, Optional[np.ndarray]]:
-        """Read a frame from the camera.
-        
-        Returns:
-            Tuple of (success flag, frame if successful)
-        """
-        success, frame = self.cap.read()
-        if not success:
-            logger.error("Failed to read from camera")
-            return False, None
+    def perform_scan_step(self) -> bool:
+        """Perform one scan step if ready"""
+        if not self.stepper.is_ready_for_operations():
+            status = self.stepper.get_status()
+            if status == "HOME_COOLDOWN":
+                logger.debug("Waiting for home cooldown to complete...")
+            elif status == "HOMING":
+                logger.debug("Homing in progress...")
+            return False
             
-        # Draw center of the video feed
-        cv2.circle(frame, self.frame_center, 6, (0, 0, 255), -1)
-        return True, frame
-    
-    def release(self) -> None:
-        """Release camera resources."""
-        self.cap.release()
-        cv2.destroyAllWindows()
-        logger.info("Camera resources released")
+        if self.stepper.scan_step(self.scan_direction, self.config.SCAN_STEP_SIZE):
+            logger.debug(f"Scanning... Direction: {self.scan_direction}, Steps: {self.config.SCAN_STEP_SIZE}")
+            self.scan_steps += self.config.SCAN_STEP_SIZE
 
-
-class PawStopperController:
-    """Main controller class for the PawStopper robot."""
-    
-    def __init__(self):
-        """Initialize the PawStopper controller."""
-        self.arduino = ArduinoCommunicator()
-        self.gpio = GPIOController()
-        self.position_tracker = PositionTracker()
-        self.detector = ObjectDetector(
-            MODEL_CONFIG['CONFIG_PATH'],
-            MODEL_CONFIG['WEIGHTS_PATH'],
-            MODEL_CONFIG['COCO_NAMES']
-        )
-        self.camera = CameraController()
-        
-        # Configuration
-        self.AREA_THRESHOLD = 15000
-        self.COOLDOWN_SECONDS = 10
-        self.last_trigger_time = 0
-        
-        # Scanning configuration
-        self.scanning_mode = True
-        self.scan_pan_direction = 1  # 1 for right, -1 for left
-        self.scan_steps_per_move = 5
-        self.scan_height_levels = [-15, -5, 5, 15]  # Different tilt levels
-        self.current_height_index = 0
-        
-        # Initialize robot position
-        self.home_robot()
-    
-    def home_robot(self) -> None:
-        """Reset robot to center position."""
-        logger.info("Homing robot to center position...")
-        pan_to_center, tilt_to_center = self.position_tracker.reset_to_center()
-        
-        if pan_to_center != 0 or tilt_to_center != 0:
-            # Send absolute position command to center
-            self.arduino.send_absolute_position(0, 0)
-            time.sleep(2)  # Wait for movement to complete
-        
-        logger.info("Robot homed to center position")
-    
-    def process_frame(self, frame: np.ndarray) -> None:
-        """Process a single frame.
-        
-        Args:
-            frame: Input frame from camera
-        """
-        frame, detections = self.detector.detect_objects(
-            frame,
-            target_objects=['cat', 'dog']
-        )
-        
-        first_detection = self._find_first_detection(detections)
-        
-        if first_detection:
-            self.scanning_mode = False
-            bbox_center = (
-                first_detection[0] + first_detection[2] // 2,
-                first_detection[1] + first_detection[3] // 2
-            )
-            logger.info(f"Target detected at {bbox_center}")
-            
-            self.arduino.send_coordinates(
-                self.camera.frame_center,
-                bbox_center
-            )
-            self.gpio.alarm_on()
-            
-            if self._check_alignment():
-                self._handle_aligned_target()
+            if self.scan_steps >= self.config.SCAN_LIMIT_STEPS:
+                self.scan_direction = "BACKWARD" if self.scan_direction == "FORWARD" else "FORWARD"
+                self.scan_steps = 0
+                logger.info(f"Scan direction changed to: {self.scan_direction}")
+            return True
         else:
-            self.gpio.alarm_off()
-            self.arduino.clear_buffer()
-            
-            # Enter scanning mode if no target detected
-            if not self.scanning_mode:
-                self.scanning_mode = True
-                logger.info("Entering scanning mode")
-            
-            self._perform_scan()
+            logger.warning("Scan step failed, retrying...")
+            return False
     
-    def _perform_scan(self) -> None:
-        """Perform horizontal sweep scanning at different heights."""
+    def reset_scan(self) -> None:
+        """Reset scan parameters"""
+        self.scan_steps = 0
+        self.scan_direction = "FORWARD"
+
+class PawStopperRobot:
+    """Main robot controller class"""
+    
+    def __init__(self, config: Config = None):
+        self.config = config or Config()
+        GPIO.setmode(GPIO.BCM)
+        self.arduino = self._initialize_arduino()
+        
+        # Initialize subsystems
+        self.stepper = StepperController(self.arduino, self.config)
+        self.relay = RelayController(self.config)
+        self.alarm = AlarmController(self.config)
+        self.detector = ObjectDetector(self.config)
+        self.scanner = ScanController(self.config, self.stepper)
+        
+        # State variables
+        self.object_tracked = False
+        self.last_trigger_time = 0
+        self.lost_since = None
+        self.last_countdown_second = None
+        
+        # Initialize camera
+        self.cap = self._initialize_camera()
+        
+    def _initialize_arduino(self) -> serial.Serial:
+        """Initialize Arduino serial connection"""
         try:
-            current_pan, current_tilt = self.position_tracker.get_position()
-            target_tilt = self.scan_height_levels[self.current_height_index]
+            arduino = serial.Serial(
+                self.config.ARDUINO_PORT, 
+                self.config.ARDUINO_BAUDRATE, 
+                timeout=self.config.SERIAL_TIMEOUT
+            )
+            time.sleep(2)  # Wait for Arduino to reset
             
-            # Move to target height if not already there
-            if current_tilt != target_tilt:
-                tilt_delta = target_tilt - current_tilt
-                if self.position_tracker.is_within_limits(0, tilt_delta):
-                    self.arduino.send_absolute_position(current_pan, target_tilt)
-                    self.position_tracker.update_position(0, tilt_delta)
-                    time.sleep(0.2)
-                    return
-            
-            # Perform horizontal scan
-            pan_delta = self.scan_steps_per_move * self.scan_pan_direction
-            
-            if self.position_tracker.is_within_limits(pan_delta, 0):
-                new_pan = current_pan + pan_delta
-                self.arduino.send_absolute_position(new_pan, current_tilt)
-                self.position_tracker.update_position(pan_delta, 0)
+            # Wait for Arduino ready signal
+            logger.info("Waiting for Arduino...")
+            start_time = time.time()
+            while time.time() - start_time < 5.0:
+                if arduino.in_waiting > 0:
+                    response = arduino.readline().decode().strip()
+                    if "Arduino ready" in response:
+                        logger.info("Arduino connected successfully!")
+                        break
             else:
-                # Reached limit, change direction and move to next height
-                self.scan_pan_direction *= -1
-                self.current_height_index = (self.current_height_index + 1) % len(self.scan_height_levels)
-                logger.debug(f"Scan: Changed direction, height level: {self.current_height_index}")
-            
-            time.sleep(0.1)  # Small delay between scan steps
+                logger.warning("Arduino ready signal not received, continuing anyway...")
+                
+            return arduino
             
         except Exception as e:
-            logger.error(f"Error during scanning: {e}")
+            logger.error(f"Failed to initialize Arduino: {e}")
+            raise
     
-    def _find_first_detection(self, detections: List) -> Optional[tuple]:
-        """Find the first detected object above threshold.
-        
-        Args:
-            detections: List of detected objects
-            
-        Returns:
-            Bounding box of first qualifying object or None
-        """
-        for box, name, confidence, center in detections:
-            bbox_area = box[2] * box[3]
-            logger.debug(
-                f"Detection: {name.upper()} | "
-                f"Confidence: {confidence}% | "
-                f"Area: {bbox_area}"
-            )
-            
-            if bbox_area > self.AREA_THRESHOLD:
-                logger.info(f"First target selected: {name.upper()} (Area: {bbox_area})")
-                return box
-        
-        return None
+    def _initialize_camera(self) -> cv2.VideoCapture:
+        """Initialize camera"""
+        try:
+            cap = cv2.VideoCapture(0)
+            cap.set(3, self.config.CAMERA_WIDTH)
+            cap.set(4, self.config.CAMERA_HEIGHT)
+            logger.info("Camera initialized successfully")
+            return cap
+        except Exception as e:
+            logger.error(f"Failed to initialize camera: {e}")
+            raise
     
-    def _check_alignment(self) -> bool:
-        """Check if Arduino reports alignment."""
-        msg = self.arduino.read_message()
-        if msg == "ALIGNED":
+    def _display_ui_info(self, img) -> None:
+        """Display UI information on the image"""
+        pos_x, pos_y = self.stepper.get_position()
+        status = self.stepper.get_status()
+        
+        cv2.putText(img, f"Pos: X={pos_x}, Y={pos_y}", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(img, f"Status: {status}", (10, 55), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(img, f"Tolerance: {self.stepper.tolerance}", (10, 80), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(img, f"Step Size: {self.stepper.track_step_size}", (10, 100), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(img, "Controls: Q=Quit, R=Reset, H=Home, P=Info", 
+                    (10, img.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+    
+    def _handle_object_tracking(self, img, object_info) -> bool:
+        """Handle object tracking logic"""
+        biggest_box = None
+        max_area = 0
+        alarm_triggered = False
+
+        for obj in object_info:
+            box, name, conf, center = obj
+            area = box[2] * box[3]
+            if area > self.config.AREA_THRESHOLD:
+                alarm_triggered = True
+                if area > max_area:
+                    max_area = area
+                    biggest_box = box
+
+        current_time = time.time()
+        frame_center = (self.config.CAMERA_WIDTH//2, self.config.CAMERA_HEIGHT//2)
+        cv2.circle(img, frame_center, 6, (0, 0, 255), -1)  # Red center dot
+
+        if alarm_triggered and biggest_box is not None:
+            bbox_center = (biggest_box[0] + biggest_box[2]//2, biggest_box[1] + biggest_box[3]//2)
+            
+            aligned, moved = self.stepper.track_object(frame_center, bbox_center)
+            
+            self.alarm.alarm_on()
+            self.object_tracked = True
+            self.lost_since = None
+
+            # Add some visual feedback for alignment status
+            alignment_color = (0, 255, 0) if aligned else (0, 0, 255)  # Green if aligned, red if not
+            cv2.circle(img, bbox_center, 8, alignment_color, 2)
+            cv2.line(img, frame_center, bbox_center, alignment_color, 1)
+            
+            # Display alignment info on frame
+            error_x = frame_center[0] - bbox_center[0]
+            error_y = frame_center[1] - bbox_center[1]
+            cv2.putText(img, f"Error X: {error_x}, Y: {error_y}", 
+                        (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(img, f"Aligned: {aligned}", 
+                        (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, alignment_color, 1)
+
+            # If aligned and cooldown period has passed, trigger relay
+            if aligned and current_time - self.last_trigger_time > self.config.COOLDOWN_SECONDS:
+                self.relay.trigger_relay_async(self.config.RELAY_DURATION)
+                self.last_trigger_time = current_time
+                
+                # Add a small delay after triggering to avoid immediate movement
+                time.sleep(0.2)
+            
             return True
-        elif msg and msg.startswith("POS:"):
-            # Update position from Arduino feedback
-            try:
-                parts = msg.split(":")
-                if len(parts) == 2:
-                    pan, tilt = map(int, parts[1].split(","))
-                    self.position_tracker.pan_steps = pan
-                    self.position_tracker.tilt_steps = tilt
-                    self.position_tracker.save_position()
-            except ValueError:
-                logger.error(f"Invalid position feedback: {msg}")
+        
         return False
     
-    def _handle_aligned_target(self) -> None:
-        """Handle aligned target detection."""
+    def _handle_object_lost(self) -> None:
+        """Handle logic when object is lost"""
         current_time = time.time()
-        if current_time - self.last_trigger_time > self.COOLDOWN_SECONDS:
-            self.gpio.trigger_relay_async(5)
-            self.last_trigger_time = current_time
+        
+        if self.object_tracked:
+            if self.lost_since is None:
+                self.lost_since = current_time
+                logger.info("Object lost. Starting countdown before going home...")
+                self.last_countdown_second = self.config.LOST_OBJECT_TIMEOUT
+            else:
+                elapsed = int(current_time - self.lost_since)
+                remaining = self.config.LOST_OBJECT_TIMEOUT - elapsed
+                if remaining != self.last_countdown_second and remaining > 0:
+                    logger.info(f"Object lost countdown: {remaining}")
+                    self.last_countdown_second = remaining
+                elif remaining <= 0:
+                    logger.info("Countdown complete, initiating home sequence...")
+                    if self.stepper.go_home():
+                        self.object_tracked = False
+                        self.lost_since = None
+                        self.scanner.reset_scan()
+                    else:
+                        logger.warning("Failed to start homing, will retry...")
+                        self.lost_since = current_time  # Reset countdown
+        else:
+            # Only scan if stepper is ready
+            if self.stepper.is_ready_for_operations():
+                self.scanner.perform_scan_step()
+    
+    def _handle_keyboard_input(self) -> bool:
+        """Handle keyboard input, returns True if should quit"""
+        key = cv2.waitKey(1) & 0xFF
+        
+        if key == ord('q'):
+            logger.info("Quitting. Sending robot to home position.")
+            self.stepper.force_go_home_sync()
+            return True
+        elif key == ord('r'):
+            logger.info("Manually resetting position to (0,0)")
+            self.stepper.manual_reset_position(0, 0)
+        elif key == ord('h'):
+            logger.info("Manual home command")
+            self.stepper.go_home()
+        elif key == ord('p'):
+            info = self.stepper.get_position_info()
+            logger.info(f"Current position info: {info}")
+            
+        return False
     
     def run(self) -> None:
-        """Run the main control loop."""
+        """Main robot control loop"""
+        logger.info("Starting PawStopper Robot...")
+        
         try:
             while True:
-                success, frame = self.camera.read_frame()
+                success, img = self.cap.read()
                 if not success:
+                    logger.error("Failed to read from camera")
                     break
-                    
-                self.process_frame(frame)
+
+                self._display_ui_info(img)
                 
-                # Display scanning status
-                status_text = "SCANNING" if self.scanning_mode else "TRACKING"
-                cv2.putText(frame, status_text, (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+                # Detect objects
+                result_img, object_info = self.detector.detect_objects(img)
                 
-                cv2.imshow("Output", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                # Handle object tracking or scanning
+                object_detected = self._handle_object_tracking(result_img, object_info)
+                
+                if not object_detected:
+                    self.alarm.alarm_off()
+                    # Only reset buffer if not homing to avoid interference
+                    if not self.stepper.is_homing:
+                        self.arduino.reset_input_buffer()
+                    self._handle_object_lost()
+
+                cv2.imshow("PawStopper Output", result_img)
+                
+                # Handle keyboard input
+                if self._handle_keyboard_input():
                     break
-                elif cv2.waitKey(1) & 0xFF == ord('h'):
-                    self.home_robot()
-                    
+
         except KeyboardInterrupt:
-            logger.info("Program interrupted by user")
+            logger.info("Interrupted by user")
+            self.stepper.force_go_home_sync()
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
         finally:
             self.cleanup()
     
     def cleanup(self) -> None:
-        """Clean up resources."""
-        self.gpio.cleanup()
-        self.arduino.close()
-        self.camera.release()
+        """Clean up resources"""
+        logger.info("Cleaning up...")
+        self.stepper.emergency_stop()
+        if hasattr(self, 'cap'):
+            self.cap.release()
+        cv2.destroyAllWindows()
+        GPIO.cleanup()
+        if hasattr(self, 'arduino'):
+            self.arduino.close()
+        logger.info("Cleanup complete!")
 
+def main():
+    """Main entry point"""
+    try:
+        config = Config()
+        robot = PawStopperRobot(config)
+        robot.run()
+    except Exception as e:
+        logger.error(f"Failed to start robot: {e}")
+        raise
 
 if __name__ == "__main__":
-    import numpy as np
-    
-    controller = PawStopperController()
-    controller.run()
-
+    main()
