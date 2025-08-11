@@ -38,35 +38,5 @@ void loop() {
         }
       }
     }
-    else if (data.startsWith("SPEED")) {
-      // New format: SPEED X 20 | SPEED Y 20 | SPEED BOTH 20
-      int firstSpace = data.indexOf(' ');
-      int secondSpace = data.indexOf(' ', firstSpace + 1);
-      if (firstSpace > 0 && secondSpace > firstSpace) {
-        String axis = data.substring(firstSpace + 1, secondSpace);
-        int rpm = data.substring(secondSpace + 1).toInt();
-        bool ok = false;
-
-        if (rpm > 0) {
-          if (axis == "X") {
-            stepperX.setSpeed(rpm);
-            ok = true;
-          } else if (axis == "Y") {
-            stepperY.setSpeed(rpm);
-            ok = true;
-          } else if (axis == "BOTH") {
-            stepperX.setSpeed(rpm);
-            stepperY.setSpeed(rpm);
-            ok = true;
-          }
-        }
-
-        if (ok) {
-          Serial.println("SPEED_OK");
-        } else {
-          Serial.println("SPEED_ERROR");
-        }
-      }
-    }
   }
 }

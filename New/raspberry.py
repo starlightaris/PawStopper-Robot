@@ -40,9 +40,6 @@ class Config:
     DEFAULT_TRACK_STEP_SIZE: int = 5
     MAX_CHUNK_SIZE: int = 50
     MAX_RETRIES: int = 3
-    # New: per-mode speeds (RPM)
-    SCAN_SPEED_RPM: int = 50   # keep scan speed same as Arduino default
-    TRACK_SPEED_RPM: int = 20  # lower speed for smooth tracking
     
     # Scanning Parameters
     SCAN_LIMIT_STEPS: int = 1024  # 180 degrees
@@ -88,11 +85,7 @@ class StepperController:
         self.home_cooldown_active: bool = False
         self._lock = threading.Lock()
         self._homing_complete_event = threading.Event()
-        # New: speed/mode state
-        self.current_mode: Optional[str] = None
-        self.current_rpm_x: Optional[int] = None
-        self.current_rpm_y: Optional[int] = None
-
+        
     def send_step_command(self, axis: str, direction: str, steps: int) -> bool:
         """Send step command to Arduino and wait for confirmation"""
         cmd = f"STEP {axis} {direction} {steps}\n"
@@ -137,64 +130,6 @@ class StepperController:
             logger.error(f"Error sending step command: {e}")
             return False
     
-    # New: send a SPEED command and wait for SPEED_OK
-    def send_speed_command(self, axis: str, rpm: int) -> bool:
-        cmd = f"SPEED {axis} {rpm}\n"
-        try:
-            with self._lock:
-                self.arduino.reset_input_buffer()
-                time.sleep(0.05)
-                self.arduino.write(cmd.encode())
-                self.arduino.flush()
-                logger.debug(f"Sent: {cmd.strip()}")
-
-                start_time = time.time()
-                while time.time() - start_time < self.config.COMMAND_TIMEOUT:
-                    if self.arduino.in_waiting > 0:
-                        try:
-                            response = self.arduino.readline().decode().strip()
-                            if response:
-                                logger.debug(f"Arduino response: '{response}'")
-                                if response == "SPEED_OK":
-                                    return True
-                                if response == "SPEED_ERROR":
-                                    return False
-                        except UnicodeDecodeError:
-                            continue
-                    time.sleep(0.01)
-                logger.error("Timeout waiting for SPEED_OK acknowledgment")
-                return False
-        except Exception as e:
-            logger.error(f"Error sending speed command: {e}")
-            return False
-
-    # New: set per-axis speed with caching
-    def _ensure_axis_speed(self, axis: str, desired_rpm: int) -> bool:
-        current = self.current_rpm_x if axis == "X" else self.current_rpm_y
-        if current == desired_rpm:
-            return True
-        ok = self.send_speed_command(axis, desired_rpm)
-        if ok:
-            if axis == "X":
-                self.current_rpm_x = desired_rpm
-            else:
-                self.current_rpm_y = desired_rpm
-        return ok
-
-    # New: set operating mode (SCAN or TRACK)
-    def set_mode(self, mode: str) -> bool:
-        if mode == self.current_mode:
-            return True
-        desired = self.config.SCAN_SPEED_RPM if mode == "SCAN" else self.config.TRACK_SPEED_RPM
-        ok_x = self._ensure_axis_speed("X", desired)
-        ok_y = self._ensure_axis_speed("Y", desired)
-        if ok_x and ok_y:
-            self.current_mode = mode
-            logger.debug(f"Speed mode set to {mode} (RPM={desired})")
-            return True
-        logger.warning(f"Failed to set speed mode to {mode}")
-        return False
-
     def _update_position(self, axis: str, direction: str, steps: int) -> None:
         """Update position tracking after successful movement"""
         if axis == "X":
@@ -274,9 +209,6 @@ class StepperController:
                 home_success = False
                 return False
             
-            # Ensure homing uses scan speed
-            self.set_mode("SCAN")
-
             # Clear any pending data
             with self._lock:
                 self.arduino.reset_input_buffer()
@@ -385,8 +317,6 @@ class StepperController:
     
     def track_object(self, frame_center: Tuple[int, int], object_center: Tuple[int, int]) -> Tuple[bool, bool]:
         """Track object by calculating error and moving steppers accordingly"""
-        # Ensure low speed for smooth tracking
-        self.set_mode("TRACK")
         error_x = frame_center[0] - object_center[0]
         error_y = frame_center[1] - object_center[1]
         
@@ -417,8 +347,6 @@ class StepperController:
         """Perform one scan step if ready"""
         if not self.is_ready_for_operations():
             return False
-        # Ensure scan mode speed before scanning
-        self.set_mode("SCAN")
         return self.step_x(direction, step_size)
     
     def is_ready_for_operations(self) -> bool:
@@ -616,9 +544,6 @@ class ScanController:
                 logger.debug("Homing in progress...")
             return False
             
-        # Ensure scan mode speed before scanning
-        self.stepper.set_mode("SCAN")
-
         if self.stepper.scan_step(self.scan_direction, self.config.SCAN_STEP_SIZE):
             logger.debug(f"Scanning... Direction: {self.scan_direction}, Steps: {self.config.SCAN_STEP_SIZE}")
             self.scan_steps += self.config.SCAN_STEP_SIZE
@@ -660,9 +585,6 @@ class PawStopperRobot:
         
         # Initialize camera
         self.cap = self._initialize_camera()
-
-        # Initialize hardware to scan speed
-        self.stepper.set_mode("SCAN")
         
     def _initialize_arduino(self) -> serial.Serial:
         """Initialize Arduino serial connection"""
