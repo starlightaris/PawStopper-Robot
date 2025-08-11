@@ -14,6 +14,7 @@ from typing import Tuple, List, Dict, Optional, Any
 from dataclasses import dataclass
 import queue
 from concurrent.futures import ThreadPoolExecutor
+import numpy as np
 
 # Configure logging
 logging.basicConfig(
@@ -69,6 +70,9 @@ class Config:
     CAMERA_HEIGHT: int = 240  # Reduced from 480
     INPUT_SIZE: Tuple[int, int] = (160, 160)  # Reduced from (320, 320)
     CAMERA_FPS: int = 15  # Limit FPS
+    CAMERA_BUFFER_SIZE: int = 1  # Reduce buffer to prevent corruption
+    FRAME_RETRY_COUNT: int = 3  # Retry corrupted frames
+    CAMERA_WARMUP_FRAMES: int = 5  # Skip initial frames
     
     # File Paths
     COCO_NAMES_PATH: str = "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/coco.names"
@@ -704,6 +708,12 @@ class PawStopperRobot:
         self.lost_since = None
         self.last_countdown_second = None
         
+        # Camera frame validation variables
+        self.consecutive_frame_failures = 0
+        self.max_consecutive_failures = 10
+        self.last_valid_frame = None
+        self.frame_validation_enabled = True
+        
         # Initialize camera with optimizations
         self.cap = self._initialize_camera()
         
@@ -736,16 +746,38 @@ class PawStopperRobot:
             raise
     
     def _initialize_camera(self) -> cv2.VideoCapture:
-        """Initialize camera with performance optimizations"""
+        """Initialize camera with performance optimizations and corruption handling"""
         try:
             cap = cv2.VideoCapture(0)
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.CAMERA_WIDTH)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.CAMERA_HEIGHT)
-            cap.set(cv2.CAP_PROP_FPS, self.config.CAMERA_FPS)
             
-            # Additional optimizations
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer size
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+            # Set camera properties with error checking
+            properties = [
+                (cv2.CAP_PROP_FRAME_WIDTH, self.config.CAMERA_WIDTH),
+                (cv2.CAP_PROP_FRAME_HEIGHT, self.config.CAMERA_HEIGHT),
+                (cv2.CAP_PROP_FPS, self.config.CAMERA_FPS),
+                (cv2.CAP_PROP_BUFFERSIZE, self.config.CAMERA_BUFFER_SIZE),
+                (cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G')),
+                (cv2.CAP_PROP_AUTO_EXPOSURE, 0.25),  # Reduce auto-exposure for stability
+            ]
+            
+            for prop, value in properties:
+                if not cap.set(prop, value):
+                    logger.warning(f"Failed to set camera property {prop} to {value}")
+            
+            # Verify camera is working
+            if not cap.isOpened():
+                raise Exception("Camera failed to open")
+            
+            # Test frame capture
+            test_success, test_frame = cap.read()
+            if not test_success or test_frame is None:
+                raise Exception("Camera test read failed")
+            
+            # Warm up camera by capturing and discarding initial frames
+            logger.info("Warming up camera...")
+            for i in range(self.config.CAMERA_WARMUP_FRAMES):
+                cap.read()
+                time.sleep(0.1)
             
             # Verify settings
             actual_width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
@@ -753,10 +785,108 @@ class PawStopperRobot:
             actual_fps = cap.get(cv2.CAP_PROP_FPS)
             
             logger.info(f"Camera initialized: {actual_width}x{actual_height} @ {actual_fps}fps")
+            logger.info("Camera warmup complete")
             return cap
+            
         except Exception as e:
             logger.error(f"Failed to initialize camera: {e}")
             raise
+    
+    def _validate_frame(self, frame) -> bool:
+        """Validate frame to detect corruption"""
+        if frame is None:
+            return False
+        
+        # Check if frame has correct dimensions
+        if len(frame.shape) != 3:
+            return False
+        
+        height, width, channels = frame.shape
+        if height != self.config.CAMERA_HEIGHT or width != self.config.CAMERA_WIDTH or channels != 3:
+            return False
+        
+        # Check for completely black or white frames (common corruption signs)
+        mean_brightness = np.mean(frame)
+        if mean_brightness < 5 or mean_brightness > 250:
+            return False
+        
+        # Check for reasonable variance (not a solid color)
+        if np.std(frame) < 5:
+            return False
+        
+        return True
+    
+    def _capture_valid_frame(self) -> Tuple[bool, Optional[np.ndarray]]:
+        """Capture a frame with corruption handling and retry logic"""
+        for attempt in range(self.config.FRAME_RETRY_COUNT):
+            try:
+                # Clear buffer before reading to get fresh frame
+                for _ in range(self.config.CAMERA_BUFFER_SIZE + 1):
+                    success, frame = self.cap.read()
+                    if not success:
+                        break
+                
+                if not success or frame is None:
+                    logger.warning(f"Frame capture failed, attempt {attempt + 1}")
+                    continue
+                
+                # Validate frame if validation is enabled
+                if self.frame_validation_enabled and not self._validate_frame(frame):
+                    logger.warning(f"Frame validation failed, attempt {attempt + 1}")
+                    continue
+                
+                # Frame is valid
+                self.consecutive_frame_failures = 0
+                self.last_valid_frame = frame.copy()
+                return True, frame
+                
+            except Exception as e:
+                logger.warning(f"Exception during frame capture, attempt {attempt + 1}: {e}")
+                continue
+        
+        # All attempts failed
+        self.consecutive_frame_failures += 1
+        logger.error(f"Failed to capture valid frame after {self.config.FRAME_RETRY_COUNT} attempts")
+        
+        # If too many consecutive failures, try to reinitialize camera
+        if self.consecutive_frame_failures >= self.max_consecutive_failures:
+            logger.error("Too many consecutive frame failures, attempting camera reset...")
+            return self._handle_camera_failure()
+        
+        # Return last valid frame if available
+        if self.last_valid_frame is not None:
+            logger.info("Using last valid frame due to capture failure")
+            return True, self.last_valid_frame.copy()
+        
+        return False, None
+    
+    def _handle_camera_failure(self) -> Tuple[bool, Optional[np.ndarray]]:
+        """Handle persistent camera failures by reinitializing"""
+        try:
+            logger.info("Attempting to reinitialize camera...")
+            
+            # Close current camera
+            if hasattr(self, 'cap') and self.cap is not None:
+                self.cap.release()
+                time.sleep(1)
+            
+            # Try to reinitialize
+            self.cap = self._initialize_camera()
+            self.consecutive_frame_failures = 0
+            
+            # Try to capture a frame
+            success, frame = self.cap.read()
+            if success and frame is not None:
+                logger.info("Camera reinitialization successful")
+                self.last_valid_frame = frame.copy()
+                return True, frame
+            else:
+                logger.error("Camera reinitialization failed")
+                return False, None
+                
+        except Exception as e:
+            logger.error(f"Camera reinitialization failed: {e}")
+            return False, None
     
     def _display_ui_info(self, img) -> None:
         """Display UI information on the image - optimized"""
@@ -771,7 +901,13 @@ class PawStopperRobot:
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
         cv2.putText(img, f"{status}", (5, 30), 
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 255), thickness)
-        cv2.putText(img, "Q=Quit R=Reset H=Home", 
+        
+        # Show frame failure count if any
+        if self.consecutive_frame_failures > 0:
+            cv2.putText(img, f"Frame Failures: {self.consecutive_frame_failures}", (5, 45), 
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), thickness)
+        
+        cv2.putText(img, "Q=Quit R=Reset H=Home V=Toggle Validation", 
                     (5, img.shape[0] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 255), 1)
     
     def _handle_object_tracking(self, img, object_info) -> bool:
@@ -857,26 +993,38 @@ class PawStopperRobot:
         elif key == ord('p'):
             info = self.stepper.get_position_info()
             logger.info(f"Current position info: {info}")
+        elif key == ord('v'):
+            self.frame_validation_enabled = not self.frame_validation_enabled
+            logger.info(f"Frame validation {'enabled' if self.frame_validation_enabled else 'disabled'}")
+        elif key == ord('c'):
+            logger.info("Manual camera reset")
+            self._handle_camera_failure()
             
         return False
     
     def run(self) -> None:
-        """Main robot control loop - optimized"""
-        logger.info("Starting PawStopper Robot with performance optimizations...")
+        """Main robot control loop - optimized with corruption handling"""
+        logger.info("Starting PawStopper Robot with performance optimizations and corruption handling...")
         
         try:
             while True:
-                success, img = self.cap.read()
-                if not success:
-                    logger.error("Failed to read from camera")
-                    break
+                # Use improved frame capture with corruption handling
+                success, img = self._capture_valid_frame()
+                if not success or img is None:
+                    logger.error("Failed to capture valid frame, retrying...")
+                    time.sleep(0.1)  # Brief pause before retry
+                    continue
 
                 # Only update UI every few frames for performance
                 if self.detector.frame_count % 3 == 0:
                     self._display_ui_info(img)
                 
                 # Detect objects (now optimized with frame skipping)
-                result_img, object_info = self.detector.detect_objects(img)
+                try:
+                    result_img, object_info = self.detector.detect_objects(img)
+                except Exception as e:
+                    logger.warning(f"Object detection failed: {e}")
+                    result_img, object_info = img, []
                 
                 # Handle object tracking or scanning
                 object_detected = self._handle_object_tracking(result_img, object_info)
@@ -888,7 +1036,11 @@ class PawStopperRobot:
                         self.arduino.reset_input_buffer()
                     self._handle_object_lost()
 
-                cv2.imshow("PawStopper Output", result_img)
+                # Safe display with error handling
+                try:
+                    cv2.imshow("PawStopper Output", result_img)
+                except Exception as e:
+                    logger.warning(f"Display error: {e}")
                 
                 # Handle keyboard input
                 if self._handle_keyboard_input():
@@ -898,7 +1050,9 @@ class PawStopperRobot:
             logger.info("Interrupted by user")
             self.stepper.force_go_home_sync()
         except Exception as e:
-            logger.error(f"Unexpected error: {e}")
+            logger.error(f"Unexpected error in main loop: {e}")
+            # Try to continue running
+            time.sleep(1)
         finally:
             self.cleanup()
     
@@ -907,11 +1061,11 @@ class PawStopperRobot:
         logger.info("Cleaning up...")
         self.stepper.emergency_stop()
         self.detector.cleanup()  # Clean up detection resources
-        if hasattr(self, 'cap'):
+        if hasattr(self, 'cap') and self.cap is not None:
             self.cap.release()
         cv2.destroyAllWindows()
         GPIO.cleanup()
-        if hasattr(self, 'arduino'):
+        if hasattr(self, 'arduino') and self.arduino is not None:
             self.arduino.close()
         logger.info("Cleanup complete!")
 
