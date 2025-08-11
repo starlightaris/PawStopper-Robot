@@ -137,63 +137,88 @@ class StepperController:
             return False
     
     def set_motor_speed(self, speed: int) -> bool:
-        """Set motor speed on Arduino"""
+        """Set motor speed on Arduino with retry logic"""
         cmd = f"SPEED {speed}\n"
         
-        try:
-            with self._lock:
-                self.arduino.reset_input_buffer()
-                time.sleep(0.1)
-                
-                self.arduino.write(cmd.encode())
-                self.arduino.flush()
-                logger.debug(f"Sent speed command: {cmd.strip()}")
-                
-                # Wait for acknowledgment
-                start_time = time.time()
-                while time.time() - start_time < self.config.COMMAND_TIMEOUT:
-                    if self.arduino.in_waiting > 0:
-                        try:
-                            response = self.arduino.readline().decode().strip()
-                            if response:
-                                logger.debug(f"Speed response: '{response}'")
-                                if response == "SPEED_OK":
-                                    self.current_speed = speed
-                                    logger.debug(f"Motor speed set to: {speed}")
-                                    return True
-                                elif response == "SPEED_ERROR":
-                                    logger.error("Arduino reported speed error")
-                                    return False
-                        except UnicodeDecodeError:
-                            continue
-                    time.sleep(0.01)
-                
-                logger.error("Timeout waiting for SPEED_OK acknowledgment")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error setting motor speed: {e}")
-            return False
+        # Don't try to change speed if it's the same
+        if self.current_speed == speed:
+            return True
+        
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                with self._lock:
+                    # Clear buffers and wait longer for stability
+                    self.arduino.reset_input_buffer()
+                    self.arduino.reset_output_buffer()
+                    time.sleep(0.2)  # Increased delay for stability
+                    
+                    self.arduino.write(cmd.encode())
+                    self.arduino.flush()
+                    logger.debug(f"Sent speed command: {cmd.strip()} (attempt {attempt + 1})")
+                    
+                    # Wait for acknowledgment with longer timeout
+                    start_time = time.time()
+                    response_timeout = 2.0  # Increased timeout for speed commands
+                    
+                    while time.time() - start_time < response_timeout:
+                        if self.arduino.in_waiting > 0:
+                            try:
+                                response = self.arduino.readline().decode().strip()
+                                if response:
+                                    logger.debug(f"Speed response: '{response}'")
+                                    if response == "SPEED_OK":
+                                        self.current_speed = speed
+                                        logger.debug(f"Motor speed successfully set to: {speed} RPM")
+                                        return True
+                                    elif response == "SPEED_ERROR":
+                                        logger.error(f"Arduino reported speed error on attempt {attempt + 1}")
+                                        break  # Try again
+                            except UnicodeDecodeError:
+                                logger.warning("Malformed speed response received")
+                                continue
+                        time.sleep(0.02)  # Slightly longer polling interval
+                    
+                    logger.warning(f"Timeout waiting for SPEED_OK on attempt {attempt + 1}")
+                    
+            except Exception as e:
+                logger.error(f"Exception setting motor speed on attempt {attempt + 1}: {e}")
+            
+            # Wait before retry
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
+        
+        logger.error(f"Failed to set motor speed to {speed} after {max_retries} attempts")
+        return False
 
     def enter_tracking_mode(self) -> bool:
         """Switch to tracking mode with lower speed"""
         if self.current_speed != self.config.TRACK_SPEED:
-            logger.debug("Switching to tracking mode (low speed)")
-            return self.set_motor_speed(self.config.TRACK_SPEED)
+            logger.debug(f"Switching to tracking mode: {self.current_speed} -> {self.config.TRACK_SPEED} RPM")
+            success = self.set_motor_speed(self.config.TRACK_SPEED)
+            if not success:
+                logger.warning(f"Failed to set tracking speed, staying at {self.current_speed} RPM")
+            return success
         return True
 
     def enter_scanning_mode(self) -> bool:
         """Switch to scanning mode with higher speed"""
         if self.current_speed != self.config.SCAN_SPEED:
-            logger.debug("Switching to scanning mode (high speed)")
-            return self.set_motor_speed(self.config.SCAN_SPEED)
+            logger.debug(f"Switching to scanning mode: {self.current_speed} -> {self.config.SCAN_SPEED} RPM")
+            success = self.set_motor_speed(self.config.SCAN_SPEED)
+            if not success:
+                logger.warning(f"Failed to set scanning speed, staying at {self.current_speed} RPM")
+            return success
         return True
 
     def enter_homing_mode(self) -> bool:
         """Switch to homing mode with medium speed"""
         if self.current_speed != self.config.HOME_SPEED:
-            logger.debug("Switching to homing mode (medium speed)")
-            return self.set_motor_speed(self.config.HOME_SPEED)
+            logger.debug(f"Switching to homing mode: {self.current_speed} -> {self.config.HOME_SPEED} RPM")
+            success = self.set_motor_speed(self.config.HOME_SPEED)
+            if not success:
+                logger.warning(f"Failed to set homing speed, staying at {self.current_speed} RPM")
+            return success
         return True
     
     def _update_position(self, axis: str, direction: str, steps: int) -> None:
@@ -387,9 +412,8 @@ class StepperController:
     
     def track_object(self, frame_center: Tuple[int, int], object_center: Tuple[int, int]) -> Tuple[bool, bool]:
         """Track object by calculating error and moving steppers accordingly"""
-        # Ensure we're in tracking mode with appropriate speed
-        if not self.enter_tracking_mode():
-            logger.warning("Failed to set tracking speed, continuing with current speed")
+        # Try to ensure we're in tracking mode, but don't fail if speed change fails
+        self.enter_tracking_mode()  # Removed the warning check since it's handled internally
             
         error_x = frame_center[0] - object_center[0]
         error_y = frame_center[1] - object_center[1]
@@ -422,9 +446,8 @@ class StepperController:
         if not self.is_ready_for_operations():
             return False
         
-        # Ensure we're in scanning mode with appropriate speed
-        if not self.enter_scanning_mode():
-            logger.warning("Failed to set scanning speed, continuing with current speed")
+        # Try to ensure we're in scanning mode, but don't fail if speed change fails
+        self.enter_scanning_mode()  # Removed the warning check since it's handled internally
             
         return self.step_x(direction, step_size)
     
