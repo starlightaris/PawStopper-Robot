@@ -60,7 +60,12 @@ class Config:
     # Camera Settings
     CAMERA_WIDTH: int = 640
     CAMERA_HEIGHT: int = 480
-    INPUT_SIZE: Tuple[int, int] = (320, 320)
+    INPUT_SIZE: Tuple[int, int] = (224, 224)  # Reduced for better performance
+    
+    # Performance Optimization
+    FRAME_SKIP_COUNT: int = 2  # Process every 3rd frame for detection
+    DETECTION_RESIZE_FACTOR: float = 0.5  # Resize frame before detection
+    USE_THREADING: bool = True  # Enable threaded detection
     
     # File Paths
     COCO_NAMES_PATH: str = "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/coco.names"
@@ -461,12 +466,21 @@ class AlarmController:
         GPIO.output(self.alarm_pin, GPIO.LOW)
 
 class ObjectDetector:
-    """Handles object detection using OpenCV DNN"""
+    """Handles object detection using OpenCV DNN with performance optimizations"""
     
     def __init__(self, config: Config):
         self.config = config
         self.class_names = self._load_class_names()
         self.net = self._initialize_model()
+        
+        # Performance optimization variables
+        self.frame_count = 0
+        self.last_detection_result = (None, [])
+        self.detection_thread = None
+        self.detection_lock = threading.Lock()
+        self.detection_ready = threading.Event()
+        self.current_frame = None
+        self.detection_in_progress = False
         
     def _load_class_names(self) -> List[str]:
         """Load class names from coco.names file"""
@@ -478,13 +492,29 @@ class ObjectDetector:
             return []
     
     def _initialize_model(self) -> cv2.dnn_DetectionModel:
-        """Initialize the detection model"""
+        """Initialize the detection model with optimizations"""
         try:
             net = cv2.dnn_DetectionModel(self.config.MODEL_PATH, self.config.CONFIG_PATH)
             net.setInputSize(*self.config.INPUT_SIZE)
             net.setInputScale(1.0/127.5)
             net.setInputMean((127.5, 127.5, 127.5))
             net.setInputSwapRB(True)
+            
+            # Enable optimization backends if available
+            try:
+                # Try to use OpenVINO if available (Intel optimization)
+                net.setPreferableBackend(cv2.dnn.DNN_BACKEND_INFERENCE_ENGINE)
+                net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                logger.info("Using OpenVINO backend for acceleration")
+            except:
+                try:
+                    # Fallback to OpenCV optimized backend
+                    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                    logger.info("Using OpenCV optimized backend")
+                except:
+                    logger.info("Using default backend")
+            
             logger.info("Object detection model initialized successfully")
             return net
         except Exception as e:
@@ -492,13 +522,42 @@ class ObjectDetector:
             raise
     
     def detect_objects(self, img, draw: bool = True, target_objects: List[str] = None) -> Tuple[Any, List[List]]:
-        """Detect objects and mark centers"""
+        """Detect objects with performance optimizations"""
         if target_objects is None:
             target_objects = self.config.TARGET_OBJECTS
-            
+        
+        # Frame skipping optimization
+        self.frame_count += 1
+        if self.frame_count % (self.config.FRAME_SKIP_COUNT + 1) != 0:
+            # Return previous detection result for skipped frames
+            if self.last_detection_result[0] is not None:
+                result_img = img.copy()
+                self._draw_cached_detections(result_img, self.last_detection_result[1], draw)
+                return result_img, self.last_detection_result[1]
+            else:
+                return img, []
+        
+        # Use threaded detection if enabled
+        if self.config.USE_THREADING:
+            return self._threaded_detect_objects(img, draw, target_objects)
+        else:
+            return self._synchronous_detect_objects(img, draw, target_objects)
+    
+    def _synchronous_detect_objects(self, img, draw: bool, target_objects: List[str]) -> Tuple[Any, List[List]]:
+        """Synchronous object detection with optimizations"""
         try:
+            # Resize frame for faster detection
+            if self.config.DETECTION_RESIZE_FACTOR < 1.0:
+                h, w = img.shape[:2]
+                new_h, new_w = int(h * self.config.DETECTION_RESIZE_FACTOR), int(w * self.config.DETECTION_RESIZE_FACTOR)
+                detection_img = cv2.resize(img, (new_w, new_h))
+                scale_factor = 1.0 / self.config.DETECTION_RESIZE_FACTOR
+            else:
+                detection_img = img
+                scale_factor = 1.0
+            
             classIds, confs, bbox = self.net.detect(
-                img, 
+                detection_img, 
                 confThreshold=self.config.CONFIDENCE_THRESHOLD, 
                 nmsThreshold=self.config.NMS_THRESHOLD
             )
@@ -510,6 +569,10 @@ class ObjectDetector:
                     if classId - 1 < len(self.class_names):
                         className = self.class_names[classId - 1]
                         if className in target_objects:
+                            # Scale box coordinates back to original size
+                            if scale_factor != 1.0:
+                                box = [int(coord * scale_factor) for coord in box]
+                            
                             center = (box[0] + box[2]//2, box[1] + box[3]//2)
                             object_info.append([box, className, round(confidence*100, 2), center])
                             
@@ -519,11 +582,92 @@ class ObjectDetector:
                                            (box[0]+10, box[1]+30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                                 cv2.circle(img, center, 5, (0, 255, 0), -1)
             
+            # Cache the result
+            self.last_detection_result = (img.copy(), object_info)
             return img, object_info
             
         except Exception as e:
             logger.error(f"Object detection failed: {e}")
             return img, []
+    
+    def _threaded_detect_objects(self, img, draw: bool, target_objects: List[str]) -> Tuple[Any, List[List]]:
+        """Threaded object detection for better performance"""
+        with self.detection_lock:
+            if not self.detection_in_progress:
+                self.current_frame = img.copy()
+                self.detection_in_progress = True
+                self.detection_ready.clear()
+                
+                # Start detection in a separate thread
+                self.detection_thread = threading.Thread(
+                    target=self._detection_worker, 
+                    args=(target_objects,), 
+                    daemon=True
+                )
+                self.detection_thread.start()
+        
+        # Use previous result while new detection is in progress
+        if self.last_detection_result[0] is not None:
+            result_img = img.copy()
+            self._draw_cached_detections(result_img, self.last_detection_result[1], draw)
+            return result_img, self.last_detection_result[1]
+        else:
+            return img, []
+    
+    def _detection_worker(self, target_objects: List[str]) -> None:
+        """Worker thread for object detection"""
+        try:
+            # Resize frame for faster detection
+            img = self.current_frame
+            if self.config.DETECTION_RESIZE_FACTOR < 1.0:
+                h, w = img.shape[:2]
+                new_h, new_w = int(h * self.config.DETECTION_RESIZE_FACTOR), int(w * self.config.DETECTION_RESIZE_FACTOR)
+                detection_img = cv2.resize(img, (new_w, new_h))
+                scale_factor = 1.0 / self.config.DETECTION_RESIZE_FACTOR
+            else:
+                detection_img = img
+                scale_factor = 1.0
+            
+            classIds, confs, bbox = self.net.detect(
+                detection_img, 
+                confThreshold=self.config.CONFIDENCE_THRESHOLD, 
+                nmsThreshold=self.config.NMS_THRESHOLD
+            )
+            
+            object_info = []
+            
+            if len(classIds) != 0:
+                for classId, confidence, box in zip(classIds.flatten(), confs.flatten(), bbox):
+                    if classId - 1 < len(self.class_names):
+                        className = self.class_names[classId - 1]
+                        if className in target_objects:
+                            # Scale box coordinates back to original size
+                            if scale_factor != 1.0:
+                                box = [int(coord * scale_factor) for coord in box]
+                            
+                            center = (box[0] + box[2]//2, box[1] + box[3]//2)
+                            object_info.append([box, className, round(confidence*100, 2), center])
+            
+            # Update cached result
+            with self.detection_lock:
+                self.last_detection_result = (img.copy(), object_info)
+                self.detection_in_progress = False
+                self.detection_ready.set()
+                
+        except Exception as e:
+            logger.error(f"Threaded object detection failed: {e}")
+            with self.detection_lock:
+                self.detection_in_progress = False
+    
+    def _draw_cached_detections(self, img, object_info: List[List], draw: bool) -> None:
+        """Draw cached detection results on the current frame"""
+        if draw:
+            for obj in object_info:
+                box, className, conf, center = obj
+                cv2.rectangle(img, box, (0, 255, 0), 2)
+                cv2.putText(img, f"{className.upper()} {round(conf, 2)}%", 
+                           (box[0]+10, box[1]+30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.circle(img, center, 5, (0, 255, 0), -1)
 
 class ScanController:
     """Handles scanning behavior when no object is tracked"""
@@ -567,6 +711,7 @@ class PawStopperRobot:
     
     def __init__(self, config: Config = None):
         self.config = config or Config()
+        GPIO.setmode(GPIO.BCM)
         self.arduino = self._initialize_arduino()
         
         # Initialize subsystems
@@ -614,31 +759,54 @@ class PawStopperRobot:
             raise
     
     def _initialize_camera(self) -> cv2.VideoCapture:
-        """Initialize camera"""
+        """Initialize camera with performance optimizations"""
         try:
             cap = cv2.VideoCapture(0)
-            cap.set(3, self.config.CAMERA_WIDTH)
-            cap.set(4, self.config.CAMERA_HEIGHT)
-            logger.info("Camera initialized successfully")
+            
+            # Set camera properties for better performance
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.CAMERA_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.CAMERA_HEIGHT)
+            cap.set(cv2.CAP_PROP_FPS, 15)  # Lower FPS for better performance
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to minimize latency
+            
+            # Additional optimizations for Raspberry Pi
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+            
+            logger.info("Camera initialized successfully with performance optimizations")
             return cap
         except Exception as e:
             logger.error(f"Failed to initialize camera: {e}")
             raise
     
     def _display_ui_info(self, img) -> None:
-        """Display UI information on the image"""
+        """Display UI information on the image with performance stats"""
         pos_x, pos_y = self.stepper.get_position()
         status = self.stepper.get_status()
         
-        cv2.putText(img, f"Pos: X={pos_x}, Y={pos_y}", (10, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(img, f"Status: {status}", (10, 55), 
+        # Calculate FPS for performance monitoring
+        current_time = time.time()
+        if not hasattr(self, '_fps_counter'):
+            self._fps_counter = 0
+            self._fps_start_time = current_time
+            self._fps_display = 0.0
+        
+        self._fps_counter += 1
+        if current_time - self._fps_start_time >= 1.0:
+            self._fps_display = self._fps_counter / (current_time - self._fps_start_time)
+            self._fps_counter = 0
+            self._fps_start_time = current_time
+        
+        cv2.putText(img, f"FPS: {self._fps_display:.1f}", (10, 25), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        cv2.putText(img, f"Tolerance: {self.stepper.tolerance}", (10, 80), 
+        cv2.putText(img, f"Pos: X={pos_x}, Y={pos_y}", (10, 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(img, f"Status: {status}", (10, 75), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(img, f"Tolerance: {self.stepper.tolerance}", (10, 100), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(img, f"Step Size: {self.stepper.track_step_size}", (10, 100), 
+        cv2.putText(img, f"Step Size: {self.stepper.track_step_size}", (10, 120), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(img, "Controls: Q=Quit, R=Reset, H=Home, P=Info", 
+        cv2.putText(img, "Controls: Q=Quit, R=Reset, H=Home, P=Info, +/-=Adjust", 
                     (10, img.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
     
     def _handle_object_tracking(self, img, object_info) -> bool:
@@ -708,7 +876,7 @@ class PawStopperRobot:
                 self.scanner.perform_scan_step()
     
     def _handle_keyboard_input(self) -> bool:
-        """Handle keyboard input, returns True if should quit"""
+        """Handle keyboard input with performance tuning, returns True if should quit"""
         key = cv2.waitKey(1) & 0xFF
         
         if key == ord('q'):
@@ -724,15 +892,31 @@ class PawStopperRobot:
         elif key == ord('p'):
             info = self.stepper.get_position_info()
             logger.info(f"Current position info: {info}")
+        elif key == ord('+') or key == ord('='):
+            # Increase frame skip for better performance
+            self.config.FRAME_SKIP_COUNT = min(self.config.FRAME_SKIP_COUNT + 1, 5)
+            logger.info(f"Frame skip increased to: {self.config.FRAME_SKIP_COUNT}")
+        elif key == ord('-'):
+            # Decrease frame skip for better accuracy
+            self.config.FRAME_SKIP_COUNT = max(self.config.FRAME_SKIP_COUNT - 1, 0)
+            logger.info(f"Frame skip decreased to: {self.config.FRAME_SKIP_COUNT}")
+        elif key == ord('t'):
+            # Toggle threading
+            self.config.USE_THREADING = not self.config.USE_THREADING
+            logger.info(f"Threading {'enabled' if self.config.USE_THREADING else 'disabled'}")
+        elif key == ord('s'):
+            # Cycle through resize factors
+            factors = [0.3, 0.5, 0.7, 1.0]
+            current_idx = factors.index(self.config.DETECTION_RESIZE_FACTOR) if self.config.DETECTION_RESIZE_FACTOR in factors else 1
+            next_idx = (current_idx + 1) % len(factors)
+            self.config.DETECTION_RESIZE_FACTOR = factors[next_idx]
+            logger.info(f"Detection resize factor set to: {self.config.DETECTION_RESIZE_FACTOR}")
             
         return False
     
     def run(self) -> None:
         """Main robot control loop"""
         logger.info("Starting PawStopper Robot...")
-        
-        # Setup GPIO
-        GPIO.setmode(GPIO.BCM)
         
         try:
             while True:
@@ -783,9 +967,42 @@ class PawStopperRobot:
         logger.info("Cleanup complete!")
 
 def main():
-    """Main entry point"""
+    """Main entry point with performance options"""
     try:
-        config = Config()
+        import sys
+        
+        # Choose performance preset based on command line argument
+        if len(sys.argv) > 1:
+            preset = sys.argv[1].lower()
+            if preset == "fast":
+                print("Using MAXIMUM PERFORMANCE preset")
+                from performance_config import PerformancePresets
+                config = PerformancePresets.get_maximum_performance()
+            elif preset == "balanced":
+                print("Using BALANCED preset")
+                from performance_config import PerformancePresets
+                config = PerformancePresets.get_balanced()
+            elif preset == "accurate":
+                print("Using MAXIMUM ACCURACY preset")
+                from performance_config import PerformancePresets
+                config = PerformancePresets.get_maximum_accuracy()
+            else:
+                print("Usage: python raspberry.py [fast|balanced|accurate]")
+                print("Using default configuration...")
+                config = Config()
+        else:
+            print("Using default optimized configuration")
+            print("Available presets: python raspberry.py [fast|balanced|accurate]")
+            config = Config()
+        
+        print(f"Performance settings:")
+        print(f"  Frame skip: {config.FRAME_SKIP_COUNT}")
+        print(f"  Resize factor: {config.DETECTION_RESIZE_FACTOR}")
+        print(f"  Input size: {config.INPUT_SIZE}")
+        print(f"  Camera resolution: {config.CAMERA_WIDTH}x{config.CAMERA_HEIGHT}")
+        print(f"  Threading: {config.USE_THREADING}")
+        print("Runtime controls: +/- (frame skip), s (resize), t (threading)")
+        
         robot = PawStopperRobot(config)
         robot.run()
     except Exception as e:
