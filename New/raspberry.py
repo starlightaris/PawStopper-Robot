@@ -51,6 +51,10 @@ class Config:
     NMS_THRESHOLD: float = 0.2
     TARGET_OBJECTS: List[str] = None
     
+    # Performance Optimization
+    FRAME_SKIP: int = 3  # Process every 3rd frame (adjust based on performance)
+    ENABLE_PERFORMANCE_LOGGING: bool = False
+    
     # Timing
     RELAY_DURATION: int = 5
     COOLDOWN_SECONDS: int = 10
@@ -583,9 +587,18 @@ class PawStopperRobot:
         self.lost_since = None
         self.last_countdown_second = None
         
+        # Frame skipping variables
+        self.frame_count = 0
+        self.last_object_info = []
+        self.last_detection_time = time.time()
+        
+        # Performance monitoring
+        self.detection_times = []
+        self.frame_times = []
+        
         # Initialize camera
         self.cap = self._initialize_camera()
-        
+    
     def _initialize_arduino(self) -> serial.Serial:
         """Initialize Arduino serial connection"""
         try:
@@ -639,8 +652,37 @@ class PawStopperRobot:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         cv2.putText(img, f"Step Size: {self.stepper.track_step_size}", (10, 100), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(img, "Controls: Q=Quit, R=Reset, H=Home, P=Info", 
+        
+        # Frame processing info
+        cv2.putText(img, f"Frame: {self.frame_count}", (10, 120), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(img, f"Skip: {self.config.FRAME_SKIP}", (10, 140), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Performance info (if enabled)
+        if self.config.ENABLE_PERFORMANCE_LOGGING and self.detection_times:
+            avg_detection_time = sum(self.detection_times[-10:]) / min(len(self.detection_times), 10)
+            cv2.putText(img, f"Det: {avg_detection_time:.3f}s", (10, 160), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        cv2.putText(img, "Controls: Q=Quit, R=Reset, H=Home, P=Info, F=Skip+/-", 
                     (10, img.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+    
+    def _should_process_frame(self) -> bool:
+        """Determine if current frame should be processed for detection"""
+        return self.frame_count % self.config.FRAME_SKIP == 0
+    
+    def _draw_cached_detections(self, img) -> None:
+        """Draw cached object detections on the current frame"""
+        for obj in self.last_object_info:
+            box, name, conf, center = obj
+            area = box[2] * box[3]
+            if area > self.config.AREA_THRESHOLD:
+                # Draw with slightly different color to indicate cached detection
+                cv2.rectangle(img, box, (0, 200, 200), 2)
+                cv2.putText(img, f"{name.upper()} {conf}% [CACHED]", 
+                           (box[0]+10, box[1]+30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 200), 2)
+                cv2.circle(img, center, 5, (0, 200, 200), -1)
     
     def _handle_object_tracking(self, img, object_info) -> bool:
         """Handle object tracking logic"""
@@ -725,27 +767,77 @@ class PawStopperRobot:
         elif key == ord('p'):
             info = self.stepper.get_position_info()
             logger.info(f"Current position info: {info}")
+            if self.config.ENABLE_PERFORMANCE_LOGGING and self.detection_times:
+                avg_time = sum(self.detection_times[-10:]) / min(len(self.detection_times), 10)
+                logger.info(f"Average detection time (last 10): {avg_time:.3f}s")
+        elif key == ord('f'):
+            # Decrease frame skip (more processing)
+            if self.config.FRAME_SKIP > 1:
+                self.config.FRAME_SKIP -= 1
+                logger.info(f"Frame skip decreased to: {self.config.FRAME_SKIP}")
+        elif key == ord('F'):
+            # Increase frame skip (less processing)
+            if self.config.FRAME_SKIP < 10:
+                self.config.FRAME_SKIP += 1
+                logger.info(f"Frame skip increased to: {self.config.FRAME_SKIP}")
             
         return False
     
     def run(self) -> None:
-        """Main robot control loop"""
+        """Main robot control loop with frame skipping optimization"""
         logger.info("Starting PawStopper Robot...")
+        logger.info(f"Frame skipping enabled: processing every {self.config.FRAME_SKIP} frames")
         
         try:
             while True:
+                loop_start_time = time.time()
+                
                 success, img = self.cap.read()
                 if not success:
                     logger.error("Failed to read from camera")
                     break
 
+                self.frame_count += 1
+                
+                # Always display UI info
                 self._display_ui_info(img)
                 
-                # Detect objects
-                result_img, object_info = self.detector.detect_objects(img)
+                # Process detection only on selected frames
+                if self._should_process_frame():
+                    detection_start_time = time.time()
+                    
+                    # Detect objects
+                    result_img, object_info = self.detector.detect_objects(img)
+                    
+                    # Cache the results for subsequent frames
+                    self.last_object_info = object_info
+                    self.last_detection_time = time.time()
+                    
+                    # Performance logging
+                    if self.config.ENABLE_PERFORMANCE_LOGGING:
+                        detection_time = time.time() - detection_start_time
+                        self.detection_times.append(detection_time)
+                        if len(self.detection_times) > 100:  # Keep only last 100 measurements
+                            self.detection_times = self.detection_times[-50:]
+                        
+                        if self.frame_count % 30 == 0:  # Log every 30 frames
+                            avg_time = sum(self.detection_times[-10:]) / min(len(self.detection_times), 10)
+                            logger.debug(f"Average detection time: {avg_time:.3f}s")
+                    
+                    object_info_to_use = object_info
+                else:
+                    # Use cached detection results and draw them
+                    result_img = img.copy()
+                    self._draw_cached_detections(result_img)
+                    object_info_to_use = self.last_object_info
+                    
+                    # Age out old detections (avoid tracking stale data)
+                    if time.time() - self.last_detection_time > 2.0:  # 2 second timeout
+                        object_info_to_use = []
+                        self.last_object_info = []
                 
-                # Handle object tracking or scanning
-                object_detected = self._handle_object_tracking(result_img, object_info)
+                # Handle object tracking or scanning using current or cached data
+                object_detected = self._handle_object_tracking(result_img, object_info_to_use)
                 
                 if not object_detected:
                     self.alarm.alarm_off()
@@ -759,6 +851,13 @@ class PawStopperRobot:
                 # Handle keyboard input
                 if self._handle_keyboard_input():
                     break
+                
+                # Performance monitoring for overall loop
+                if self.config.ENABLE_PERFORMANCE_LOGGING:
+                    loop_time = time.time() - loop_start_time
+                    self.frame_times.append(loop_time)
+                    if len(self.frame_times) > 100:
+                        self.frame_times = self.frame_times[-50:]
 
         except KeyboardInterrupt:
             logger.info("Interrupted by user")
