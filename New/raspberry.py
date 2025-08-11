@@ -85,7 +85,9 @@ class StepperController:
         self.home_cooldown_active: bool = False
         self._lock = threading.Lock()
         self._homing_complete_event = threading.Event()
-        
+        # Add mode tracking
+        self.current_mode: str = "SCAN"  # Default mode
+    
     def send_step_command(self, axis: str, direction: str, steps: int) -> bool:
         """Send step command to Arduino and wait for confirmation"""
         cmd = f"STEP {axis} {direction} {steps}\n"
@@ -128,6 +130,56 @@ class StepperController:
                 
         except Exception as e:
             logger.error(f"Error sending step command: {e}")
+            return False
+    
+    def send_mode_command(self, mode: str) -> bool:
+        """Send mode command to Arduino and wait for confirmation"""
+        # Only send if mode is different
+        if mode == self.current_mode:
+            return True
+            
+        cmd = f"MODE {mode}\n"
+        
+        try:
+            with self._lock:
+                # Clear any pending data before sending command
+                self.arduino.reset_input_buffer()
+                time.sleep(0.1)
+                
+                self.arduino.write(cmd.encode())
+                self.arduino.flush()
+                logger.debug(f"Sent: {cmd.strip()}")
+                
+                # Wait for acknowledgment
+                start_time = time.time()
+                responses_received = []
+                
+                while time.time() - start_time < self.config.COMMAND_TIMEOUT:
+                    if self.arduino.in_waiting > 0:
+                        try:
+                            response = self.arduino.readline().decode().strip()
+                            if response:
+                                responses_received.append(response)
+                                logger.debug(f"Arduino response: '{response}'")
+                                
+                                if response == f"MODE_{mode}_OK":
+                                    self.current_mode = mode
+                                    logger.info(f"Mode changed to: {mode}")
+                                    return True
+                                elif response.endswith("_ERROR"):
+                                    logger.error(f"Arduino reported mode error: {response}")
+                                    return False
+                        except UnicodeDecodeError:
+                            logger.warning("Received malformed data from Arduino")
+                            continue
+                    time.sleep(0.01)
+                
+                logger.error(f"Timeout waiting for MODE_{mode}_OK acknowledgment")
+                logger.debug(f"All responses received: {responses_received}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error sending mode command: {e}")
             return False
     
     def _update_position(self, axis: str, direction: str, steps: int) -> None:
@@ -317,6 +369,9 @@ class StepperController:
     
     def track_object(self, frame_center: Tuple[int, int], object_center: Tuple[int, int]) -> Tuple[bool, bool]:
         """Track object by calculating error and moving steppers accordingly"""
+        # Switch to tracking mode for smooth movement
+        self.send_mode_command("TRACK")
+        
         error_x = frame_center[0] - object_center[0]
         error_y = frame_center[1] - object_center[1]
         
@@ -347,6 +402,9 @@ class StepperController:
         """Perform one scan step if ready"""
         if not self.is_ready_for_operations():
             return False
+        
+        # Switch to scan mode for faster movement
+        self.send_mode_command("SCAN")
         return self.step_x(direction, step_size)
     
     def is_ready_for_operations(self) -> bool:
@@ -415,7 +473,8 @@ class StepperController:
             'track_step_size': self.track_step_size,
             'status': self.get_status(),
             'is_homing': self.is_homing,
-            'home_cooldown_active': self.home_cooldown_active
+            'home_cooldown_active': self.home_cooldown_active,
+            'current_mode': self.current_mode
         }
 
 class RelayController:
@@ -635,9 +694,11 @@ class PawStopperRobot:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.putText(img, f"Status: {status}", (10, 55), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        cv2.putText(img, f"Tolerance: {self.stepper.tolerance}", (10, 80), 
+        cv2.putText(img, f"Mode: {self.stepper.current_mode}", (10, 80), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        cv2.putText(img, f"Tolerance: {self.stepper.tolerance}", (10, 105), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(img, f"Step Size: {self.stepper.track_step_size}", (10, 100), 
+        cv2.putText(img, f"Step Size: {self.stepper.track_step_size}", (10, 125), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         cv2.putText(img, "Controls: Q=Quit, R=Reset, H=Home, P=Info", 
                     (10, img.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
