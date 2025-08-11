@@ -41,6 +41,11 @@ class Config:
     MAX_CHUNK_SIZE: int = 50
     MAX_RETRIES: int = 3
     
+    # Motor Speed Settings
+    SCAN_SPEED: int = 50     # Higher speed for scanning
+    TRACK_SPEED: int = 20    # Lower speed for smooth tracking
+    HOME_SPEED: int = 30     # Medium speed for homing
+    
     # Scanning Parameters
     SCAN_LIMIT_STEPS: int = 1024  # 180 degrees
     SCAN_STEP_SIZE: int = 10 # Number of steps per scan
@@ -85,6 +90,7 @@ class StepperController:
         self.home_cooldown_active: bool = False
         self._lock = threading.Lock()
         self._homing_complete_event = threading.Event()
+        self.current_speed: int = config.SCAN_SPEED  # Track current speed
         
     def send_step_command(self, axis: str, direction: str, steps: int) -> bool:
         """Send step command to Arduino and wait for confirmation"""
@@ -129,6 +135,66 @@ class StepperController:
         except Exception as e:
             logger.error(f"Error sending step command: {e}")
             return False
+    
+    def set_motor_speed(self, speed: int) -> bool:
+        """Set motor speed on Arduino"""
+        cmd = f"SPEED {speed}\n"
+        
+        try:
+            with self._lock:
+                self.arduino.reset_input_buffer()
+                time.sleep(0.1)
+                
+                self.arduino.write(cmd.encode())
+                self.arduino.flush()
+                logger.debug(f"Sent speed command: {cmd.strip()}")
+                
+                # Wait for acknowledgment
+                start_time = time.time()
+                while time.time() - start_time < self.config.COMMAND_TIMEOUT:
+                    if self.arduino.in_waiting > 0:
+                        try:
+                            response = self.arduino.readline().decode().strip()
+                            if response:
+                                logger.debug(f"Speed response: '{response}'")
+                                if response == "SPEED_OK":
+                                    self.current_speed = speed
+                                    logger.debug(f"Motor speed set to: {speed}")
+                                    return True
+                                elif response == "SPEED_ERROR":
+                                    logger.error("Arduino reported speed error")
+                                    return False
+                        except UnicodeDecodeError:
+                            continue
+                    time.sleep(0.01)
+                
+                logger.error("Timeout waiting for SPEED_OK acknowledgment")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error setting motor speed: {e}")
+            return False
+
+    def enter_tracking_mode(self) -> bool:
+        """Switch to tracking mode with lower speed"""
+        if self.current_speed != self.config.TRACK_SPEED:
+            logger.debug("Switching to tracking mode (low speed)")
+            return self.set_motor_speed(self.config.TRACK_SPEED)
+        return True
+
+    def enter_scanning_mode(self) -> bool:
+        """Switch to scanning mode with higher speed"""
+        if self.current_speed != self.config.SCAN_SPEED:
+            logger.debug("Switching to scanning mode (high speed)")
+            return self.set_motor_speed(self.config.SCAN_SPEED)
+        return True
+
+    def enter_homing_mode(self) -> bool:
+        """Switch to homing mode with medium speed"""
+        if self.current_speed != self.config.HOME_SPEED:
+            logger.debug("Switching to homing mode (medium speed)")
+            return self.set_motor_speed(self.config.HOME_SPEED)
+        return True
     
     def _update_position(self, axis: str, direction: str, steps: int) -> None:
         """Update position tracking after successful movement"""
@@ -203,6 +269,10 @@ class StepperController:
         home_success = True
         
         try:
+            # Set homing speed
+            if not self.enter_homing_mode():
+                logger.warning("Failed to set homing speed, continuing with current speed")
+            
             # Test connection before starting
             if not self.test_connection():
                 logger.error("Cannot proceed with homing - Arduino communication failed")
@@ -317,6 +387,10 @@ class StepperController:
     
     def track_object(self, frame_center: Tuple[int, int], object_center: Tuple[int, int]) -> Tuple[bool, bool]:
         """Track object by calculating error and moving steppers accordingly"""
+        # Ensure we're in tracking mode with appropriate speed
+        if not self.enter_tracking_mode():
+            logger.warning("Failed to set tracking speed, continuing with current speed")
+            
         error_x = frame_center[0] - object_center[0]
         error_y = frame_center[1] - object_center[1]
         
@@ -347,6 +421,11 @@ class StepperController:
         """Perform one scan step if ready"""
         if not self.is_ready_for_operations():
             return False
+        
+        # Ensure we're in scanning mode with appropriate speed
+        if not self.enter_scanning_mode():
+            logger.warning("Failed to set scanning speed, continuing with current speed")
+            
         return self.step_x(direction, step_size)
     
     def is_ready_for_operations(self) -> bool:
@@ -413,6 +492,7 @@ class StepperController:
             'y_position': self.current_pos_y,
             'tolerance': self.tolerance,
             'track_step_size': self.track_step_size,
+            'current_speed': self.current_speed,
             'status': self.get_status(),
             'is_homing': self.is_homing,
             'home_cooldown_active': self.home_cooldown_active
@@ -635,9 +715,11 @@ class PawStopperRobot:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.putText(img, f"Status: {status}", (10, 55), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        cv2.putText(img, f"Tolerance: {self.stepper.tolerance}", (10, 80), 
+        cv2.putText(img, f"Speed: {self.stepper.current_speed} RPM", (10, 80), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(img, f"Step Size: {self.stepper.track_step_size}", (10, 100), 
+        cv2.putText(img, f"Tolerance: {self.stepper.tolerance}", (10, 105), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(img, f"Step Size: {self.stepper.track_step_size}", (10, 125), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         cv2.putText(img, "Controls: Q=Quit, R=Reset, H=Home, P=Info", 
                     (10, img.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
