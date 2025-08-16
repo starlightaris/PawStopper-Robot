@@ -36,7 +36,7 @@ class Config:
     ALARM_PIN: int = 18
     
     # Stepper Motor Settings
-    DEFAULT_TOLERANCE: int = 15  # Increase to 20-25 to reduce oscillation if needed
+    DEFAULT_TOLERANCE: int = 25
     DEFAULT_TRACK_STEP_SIZE: int = 5
     MAX_CHUNK_SIZE: int = 50
     MAX_RETRIES: int = 3
@@ -52,8 +52,8 @@ class Config:
     TARGET_OBJECTS: List[str] = None
     
     # Timing
-    RELAY_DURATION: int = 2
-    RELAY_COOLDOWN_SECONDS: int = 4 # 2-4 = 2s cd in consecutive detection/obj staying still
+    RELAY_DURATION: int = 5
+    COOLDOWN_SECONDS: int = 10
     HOME_COOLDOWN_SECONDS: int = 5
     LOST_OBJECT_TIMEOUT: int = 5
     
@@ -69,7 +69,7 @@ class Config:
     
     def __post_init__(self):
         if self.TARGET_OBJECTS is None:
-            self.TARGET_OBJECTS = ['cat', 'dog'] #change the object here
+            self.TARGET_OBJECTS = ['cell phone']
 
 class StepperController:
     """Handles stepper motor control and position tracking"""
@@ -324,49 +324,22 @@ class StepperController:
         
         moved = False
         
-        # Calculate proportional step size - smaller steps as we get closer
-        # Min of 1 step, max of track_step_size
-        def calculate_step_size(error, axis):
-            # Calculate a proportional step based on error magnitude
-            # Larger errors = larger steps, smaller errors = smaller steps
-            abs_error = abs(error)
-            if abs_error <= self.tolerance:
-                return 0
-            
-            # Scale factor to reduce step size as we get closer
-            if abs_error > 100:
-                proportion = 1.0  # Full step size for large errors
-            else:
-                proportion = abs_error / 100.0  # Proportionally smaller steps
-                
-            # Ensure minimum step of 1, maximum of track_step_size
-            step = max(1, min(round(self.track_step_size * proportion), self.track_step_size))
-            logger.debug(f"{axis} error: {error}, calculated step: {step}")
-            return step
-        
-        # Move X axis if error is above tolerance with proportional step size
-        x_step_size = calculate_step_size(error_x, "X")
-        if x_step_size > 0:
+        # Move X axis if error is above tolerance
+        if abs(error_x) > self.tolerance:
             direction = "FORWARD" if error_x > 0 else "BACKWARD"
-            if self.step_x(direction, x_step_size):
+            if self.step_x(direction, self.track_step_size):
                 moved = True
-                time.sleep(0.05)  # Small delay after movement to stabilize
         
-        # Move Y axis if error is above tolerance with proportional step size
-        y_step_size = calculate_step_size(error_y, "Y")
-        if y_step_size > 0:
+        # Move Y axis if error is above tolerance
+        if abs(error_y) > self.tolerance:
             direction = "FORWARD" if error_y > 0 else "BACKWARD"
-            if self.step_y(direction, y_step_size):
+            if self.step_y(direction, self.track_step_size):
                 moved = True
-                time.sleep(0.05)  # Small delay after movement to stabilize
         
         # Check if aligned
         aligned = abs(error_x) <= self.tolerance and abs(error_y) <= self.tolerance
         if aligned:
             logger.debug("ALIGNED")
-        elif moved:
-            # If we made movements, give a brief pause to let the system stabilize
-            time.sleep(0.1)
             
         return aligned, moved
     
@@ -452,9 +425,7 @@ class RelayController:
         self.config = config
         self.relay_pin = config.RELAY_PIN
         GPIO.setup(self.relay_pin, GPIO.OUT)
-        GPIO.output(self.relay_pin, GPIO.HIGH)  # Initially off, but values inverted. HIGH = 0 here (temp fix)
-        
-        self.alarm = AlarmController(self.config)
+        GPIO.output(self.relay_pin, GPIO.HIGH)  # Initially off
         
     def trigger_relay(self, duration: int = None) -> None:
         """Trigger relay for specified duration"""
@@ -463,10 +434,8 @@ class RelayController:
             
         logger.info("Relay ON")
         GPIO.output(self.relay_pin, GPIO.LOW)
-        self.alarm.alarm_on()
         time.sleep(duration)
         GPIO.output(self.relay_pin, GPIO.HIGH)
-        self.alarm.alarm_off()
         logger.info("Relay OFF")
     
     def trigger_relay_async(self, duration: int = None) -> None:
@@ -697,31 +666,14 @@ class PawStopperRobot:
             
             aligned, moved = self.stepper.track_object(frame_center, bbox_center)
             
-            #self.alarm.alarm_on()
+            self.alarm.alarm_on()
             self.object_tracked = True
             self.lost_since = None
 
-            # Add some visual feedback for alignment status
-            alignment_color = (0, 255, 0) if aligned else (0, 0, 255)  # Green if aligned, red if not
-            cv2.circle(img, bbox_center, 8, alignment_color, 2)
-            cv2.line(img, frame_center, bbox_center, alignment_color, 1)
-            
-            # Display alignment info on frame
-            error_x = frame_center[0] - bbox_center[0]
-            error_y = frame_center[1] - bbox_center[1]
-            cv2.putText(img, f"Error X: {error_x}, Y: {error_y}", 
-                        (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(img, f"Aligned: {aligned}", 
-                        (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, alignment_color, 1)
-
             # If aligned and cooldown period has passed, trigger relay
-            if aligned and current_time - self.last_trigger_time > self.config.RELAY_COOLDOWN_SECONDS:
+            if aligned and current_time - self.last_trigger_time > self.config.COOLDOWN_SECONDS:
                 self.relay.trigger_relay_async(self.config.RELAY_DURATION)
-                
                 self.last_trigger_time = current_time
-                
-                # Add a small delay after triggering to avoid immediate movement
-                time.sleep(0.2)
             
             return True
         
@@ -779,6 +731,9 @@ class PawStopperRobot:
     def run(self) -> None:
         """Main robot control loop"""
         logger.info("Starting PawStopper Robot...")
+        
+        # Setup GPIO
+        GPIO.setmode(GPIO.BCM)
         
         try:
             while True:

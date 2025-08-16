@@ -36,7 +36,7 @@ class Config:
     ALARM_PIN: int = 18
     
     # Stepper Motor Settings
-    DEFAULT_TOLERANCE: int = 15  # Increase to 20-25 to reduce oscillation if needed
+    DEFAULT_TOLERANCE: int = 15  # Increased from 15 to reduce oscillation
     DEFAULT_TRACK_STEP_SIZE: int = 5
     MAX_CHUNK_SIZE: int = 50
     MAX_RETRIES: int = 3
@@ -52,8 +52,8 @@ class Config:
     TARGET_OBJECTS: List[str] = None
     
     # Timing
-    RELAY_DURATION: int = 2
-    RELAY_COOLDOWN_SECONDS: int = 4 # 2-4 = 2s cd in consecutive detection/obj staying still
+    RELAY_DURATION: int = 5
+    COOLDOWN_SECONDS: int = 10
     HOME_COOLDOWN_SECONDS: int = 5
     LOST_OBJECT_TIMEOUT: int = 5
     
@@ -69,7 +69,7 @@ class Config:
     
     def __post_init__(self):
         if self.TARGET_OBJECTS is None:
-            self.TARGET_OBJECTS = ['cat', 'dog'] #change the object here
+            self.TARGET_OBJECTS = ['cell phone']
 
 class StepperController:
     """Handles stepper motor control and position tracking"""
@@ -452,9 +452,7 @@ class RelayController:
         self.config = config
         self.relay_pin = config.RELAY_PIN
         GPIO.setup(self.relay_pin, GPIO.OUT)
-        GPIO.output(self.relay_pin, GPIO.HIGH)  # Initially off, but values inverted. HIGH = 0 here (temp fix)
-        
-        self.alarm = AlarmController(self.config)
+        GPIO.output(self.relay_pin, GPIO.HIGH)  # Initially off
         
     def trigger_relay(self, duration: int = None) -> None:
         """Trigger relay for specified duration"""
@@ -463,10 +461,8 @@ class RelayController:
             
         logger.info("Relay ON")
         GPIO.output(self.relay_pin, GPIO.LOW)
-        self.alarm.alarm_on()
         time.sleep(duration)
         GPIO.output(self.relay_pin, GPIO.HIGH)
-        self.alarm.alarm_off()
         logger.info("Relay OFF")
     
     def trigger_relay_async(self, duration: int = None) -> None:
@@ -697,7 +693,7 @@ class PawStopperRobot:
             
             aligned, moved = self.stepper.track_object(frame_center, bbox_center)
             
-            #self.alarm.alarm_on()
+            self.alarm.alarm_on()
             self.object_tracked = True
             self.lost_since = None
 
@@ -715,9 +711,8 @@ class PawStopperRobot:
                         (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, alignment_color, 1)
 
             # If aligned and cooldown period has passed, trigger relay
-            if aligned and current_time - self.last_trigger_time > self.config.RELAY_COOLDOWN_SECONDS:
+            if aligned and current_time - self.last_trigger_time > self.config.COOLDOWN_SECONDS:
                 self.relay.trigger_relay_async(self.config.RELAY_DURATION)
-                
                 self.last_trigger_time = current_time
                 
                 # Add a small delay after triggering to avoid immediate movement
