@@ -96,15 +96,17 @@ def send_coordinates(frame_center, target_center):
     print(f"[TX] {data.strip()}")
 
 def read_from_arduino():
-    if arduino and arduino.in_waiting > 0:
-        try:
-            msg = arduino.readline().decode().strip()
-            if msg:
-                print(f"[RX] {msg}")
-                return msg
-        except UnicodeDecodeError:
-            print("[ERROR] Bad serial data")
+    if not arduino:
+        return None
+    try:
+        line = arduino.readline().decode(errors="ignore").strip()
+        if line:
+            print(f"[RX] {line}")
+            return line
+    except Exception as e:
+        print(f"[ERROR] Serial read failed: {e}")
     return None
+
 
 # -------------------------------
 # Main
@@ -126,20 +128,30 @@ def main():
     homing = False
     status_text = "IDLE"
 
+    # shared frame between main loop and detection thread
+    latest_frame = {"img": None}
+
     # Threaded detection
     def detection_loop():
         nonlocal detection_result
         while True:
-            success, img = cap.read()
-            if not success: continue
-            _, detection_result = getObjects(img.copy(), 0.45, 0.2, objects=TARGET_OBJECTS)
+            if latest_frame["img"] is not None:
+                _, detection_result = getObjects(
+                    latest_frame["img"].copy(),
+                    0.45, 0.2,
+                    objects=TARGET_OBJECTS
+                )
 
     threading.Thread(target=detection_loop, daemon=True).start()
 
     try:
         while True:
             success, img = cap.read()
-            if not success: break
+            if not success:
+                break
+
+            # update the shared frame for detector
+            latest_frame["img"] = img
 
             cv2.circle(img, frame_center, 6, (0,0,255), -1)
 
@@ -192,7 +204,6 @@ def main():
                     print("[INFO] Starting scan...")
                     scanning = True
                 status_text = "SCANNING"
-                # simple scan oscillation
                 scan_offset = int(100 * (1 + (time.time() % 4 - 2)))
                 target_scan = (frame_center[0] + scan_offset, frame_center[1])
                 send_coordinates(frame_center, target_scan)
@@ -223,6 +234,7 @@ def main():
         cv2.destroyAllWindows()
         GPIO.cleanup()
         if arduino: arduino.close()
+
 
 # -------------------------------
 # Run
