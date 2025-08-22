@@ -1,33 +1,41 @@
-# Imports
+# =========================================
+# PawStopper Robot - Clean Full Behavior
+# =========================================
 import cv2
 import RPi.GPIO as GPIO
 import serial
 import time
 import threading
 
-# Open serial port to Arduino
-arduino = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
-time.sleep(2)  # Wait for Arduino to reset
+# -------------------------------
+# Arduino Serial Setup
+# -------------------------------
+try:
+    arduino = serial.Serial('/dev/ttyAMA0', 9600, timeout=1)
+    time.sleep(2)
+    print("[INFO] Arduino connected on /dev/ttyAMA0")
+except Exception as e:
+    print(f"[ERROR] Failed to connect to Arduino: {e}")
+    arduino = None
 
-# Setup relay
+# -------------------------------
+# GPIO Setup
+# -------------------------------
 GPIO.setmode(GPIO.BCM)
+
 RELAY_PIN = 17
-GPIO.setup(RELAY_PIN, GPIO.OUT)
-GPIO.output(RELAY_PIN, GPIO.HIGH)  # Initially off; HIGH = OFF, LOW = ON (temp fix inverted)
-
-def trigger_relay(duration=5):
-    print("Relay ON")
-    GPIO.output(RELAY_PIN, GPIO.LOW)
-    time.sleep(duration)
-    GPIO.output(RELAY_PIN, GPIO.HIGH)
-    print("Relay OFF")
-
-def trigger_relay_async(duration=5):
-    threading.Thread(target=trigger_relay, args=(duration,), daemon=True).start()
-
-# Alarm system
 ALARM_PIN = 18
+GPIO.setup(RELAY_PIN, GPIO.OUT)
 GPIO.setup(ALARM_PIN, GPIO.OUT)
+GPIO.output(RELAY_PIN, GPIO.LOW)
+GPIO.output(ALARM_PIN, GPIO.LOW)
+
+def trigger_relay(duration=3):
+    print("[RELAY] ON")
+    GPIO.output(RELAY_PIN, GPIO.HIGH)
+    time.sleep(duration)
+    GPIO.output(RELAY_PIN, GPIO.LOW)
+    print("[RELAY] OFF")
 
 def alarm_on():
     GPIO.output(ALARM_PIN, GPIO.HIGH)
@@ -35,145 +43,189 @@ def alarm_on():
 def alarm_off():
     GPIO.output(ALARM_PIN, GPIO.LOW)
 
-# Load object detection model
+# -------------------------------
+# Object Detection Setup
+# -------------------------------
 classNames = []
 with open("/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/coco.names", "rt") as f:
     classNames = f.read().rstrip("\n").split("\n")
 
-net = cv2.dnn_DetectionModel(
-    "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/frozen_inference_graph.pb",
-    "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/ssd_mobilenet_v3_large_coco_2020_01_14.pbtxt"
-)
+configPath = "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/ssd_mobilenet_v3_large_coco_2020_01_14.pbtxt"
+weightsPath = "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/frozen_inference_graph.pb"
+
+net = cv2.dnn_DetectionModel(weightsPath, configPath)
 net.setInputSize(320, 320)
-net.setInputScale(1.0/127.5)
-net.setInputMean((127.5,127.5,127.5))
+net.setInputScale(1.0 / 127.5)
+net.setInputMean((127.5, 127.5, 127.5))
 net.setInputSwapRB(True)
 
-# Function to detect objects and mark centers
+TARGET_OBJECTS = ['cat', 'dog']
+AREA_THRESHOLD = 15000
+COOLDOWN_SECONDS = 10
+OBJECT_LOST_TIMEOUT = 5
+
+# -------------------------------
+# Object Detection
+# -------------------------------
 def getObjects(img, thres, nms, draw=True, objects=[]):
     classIds, confs, bbox = net.detect(img, confThreshold=thres, nmsThreshold=nms)
     objectInfo = []
-    if len(objects) == 0: objects = classNames
+    if len(objects) == 0:
+        objects = classNames
     if len(classIds) != 0:
         for classId, confidence, box in zip(classIds.flatten(), confs.flatten(), bbox):
             className = classNames[classId - 1]
             if className in objects:
-                center = (box[0]+box[2]//2, box[1]+box[3]//2)
-                objectInfo.append([box, className, round(confidence*100,2), center])
+                cx = box[0] + box[2] // 2
+                cy = box[1] + box[3] // 2
+                objectInfo.append([box, className, round(confidence * 100, 2), (cx, cy)])
                 if draw:
-                    cv2.rectangle(img, box, (0,255,0),2)
-                    cv2.putText(img, f"{className.upper()} {round(confidence*100,2)}%", 
-                                (box[0]+10, box[1]+30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
-                    cv2.circle(img, center, 5, (0,255,0), -1)
+                    cv2.rectangle(img, box, (0, 255, 0), 2)
+                    cv2.putText(img, f"{className.upper()} {round(confidence*100,1)}%",
+                                (box[0], box[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+                    cv2.circle(img, (cx, cy), 5, (0,255,0), -1)
     return img, objectInfo
 
-# Tracking & scan state
-object_tracked = False
-AREA_THRESHOLD = 15000
-COOLDOWN_SECONDS = 10
-last_trigger_time = 0
+# -------------------------------
+# Arduino Communication
+# -------------------------------
+def send_coordinates(frame_center, target_center):
+    if arduino is None: return
+    data = f"{frame_center[0]},{frame_center[1]},{target_center[0]},{target_center[1]}\n"
+    arduino.write(data.encode())
+    print(f"[TX] {data.strip()}")
 
-scan_direction = "FORWARD"
-scan_limit_steps = 1024 #1024 for 180 degree
-scan_steps = 0
-scan_step_size = 10 # 10 is smoother
+def read_from_arduino():
+    if arduino and arduino.in_waiting > 0:
+        try:
+            msg = arduino.readline().decode().strip()
+            if msg:
+                print(f"[RX] {msg}")
+                return msg
+        except UnicodeDecodeError:
+            print("[ERROR] Bad serial data")
+    return None
 
-# Cooldown before going home after losing object
-home_cooldown = 5  # seconds
-lost_since = None
-
-if __name__ == "__main__":
+# -------------------------------
+# Main
+# -------------------------------
+def main():
     cap = cv2.VideoCapture(0)
-    cap.set(3,640)
-    cap.set(4,480)
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.set(3, 640)
+    cap.set(4, 480)
+
+    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_center = (frame_w // 2, frame_h // 2)
+    print(f"[INFO] Camera ready: {frame_w}x{frame_h}")
+
+    last_trigger_time = 0
+    detection_result = []
+    object_last_seen = time.time()
+    scanning = False
+    homing = False
+    status_text = "IDLE"
+
+    # Threaded detection
+    def detection_loop():
+        nonlocal detection_result
+        while True:
+            success, img = cap.read()
+            if not success: continue
+            _, detection_result = getObjects(img.copy(), 0.45, 0.2, objects=TARGET_OBJECTS)
+
+    threading.Thread(target=detection_loop, daemon=True).start()
 
     try:
         while True:
             success, img = cap.read()
             if not success: break
 
-            frame_center = (frame_width//2, frame_height//2)
-            cv2.circle(img, frame_center, 6, (0,0,255), -1)  # Red center dot
+            cv2.circle(img, frame_center, 6, (0,0,255), -1)
 
-            result, objectInfo = getObjects(img,0.45,0.2,objects=['cell phone'])  # change object name here
-
+            objects = list(detection_result)
+            alarm_triggered = False
             biggest_box = None
             max_area = 0
-            alarm_triggered = False
 
-            for obj in objectInfo:
-                box, name, conf, center = obj
-                area = box[2]*box[3]
-                if area > AREA_THRESHOLD:
-                    alarm_triggered = True
-                    if area > max_area:
+            # --- TRACKING ---
+            if objects:
+                for box, name, conf, center in objects:
+                    area = box[2] * box[3]
+                    if area > AREA_THRESHOLD and area > max_area:
+                        alarm_triggered = True
                         max_area = area
-                        biggest_box = box
+                        biggest_box = (box, center)
 
-            current_time = time.time()
-
-            if alarm_triggered and biggest_box is not None:
-                bbox_center = (biggest_box[0]+biggest_box[2]//2, biggest_box[1]+biggest_box[3]//2)
-                data = f"{frame_center[0]},{frame_center[1]},{bbox_center[0]},{bbox_center[1]}\n"
-                arduino.write(data.encode())
-                alarm_on()
-                object_tracked = True
-                lost_since = None
-
-                if arduino.in_waiting>0:
-                    msg = arduino.readline().decode().strip()
-                    if msg=="ALIGNED" and current_time-last_trigger_time>COOLDOWN_SECONDS:
-                        trigger_relay_async(5)
-                        last_trigger_time=current_time
-
+                if biggest_box:
+                    _, target_center = biggest_box
+                    send_coordinates(frame_center, target_center)
+                    alarm_on()
+                    object_last_seen = time.time()
+                    scanning = False
+                    homing = False
+                    status_text = "TRACKING"
+                else:
+                    alarm_off()
+                    status_text = "IDLE"
             else:
                 alarm_off()
-                arduino.reset_input_buffer()
 
-                if object_tracked:
-                    if lost_since is None:
-                        lost_since = current_time
-                        print("Object lost. Starting countdown before going home...")
-                        last_countdown_second = home_cooldown
-                    else:
-                        elapsed = int(current_time - lost_since)
-                        remaining = home_cooldown - elapsed
-                        if remaining != last_countdown_second and remaining > 0:
-                            print(remaining)
-                            last_countdown_second = remaining
-                        elif remaining <= 0:
-                            print("Going home...")
-                            arduino.write(b'HOME\n')
-                            object_tracked = False
-                            lost_since = None
-                            scan_steps = 0
-                else:
-                    # Passive scan mode
-                    step_cmd = f"STEP X {scan_direction} {scan_step_size}\n"
-                    arduino.write(step_cmd.encode())
-                    print(f"Scanning... Sent: {step_cmd.strip()}")
-                    scan_steps += scan_step_size
+            # --- OBJECT LOST ---
+            if time.time() - object_last_seen > OBJECT_LOST_TIMEOUT:
+                if not homing:
+                    print("[INFO] Object lost. Going home...")
+                    homing = True
+                    scanning = False
+                    status_text = "HOMING"
+                    send_coordinates(frame_center, frame_center)
 
-                    if scan_steps >= scan_limit_steps:
-                        scan_direction = "BACKWARD" if scan_direction=="FORWARD" else "FORWARD"
-                        scan_steps = 0
+            # --- INTERRUPT HOMING ---
+            if homing and objects:
+                print("[INFO] Object detected during homing. Aborting home, resuming tracking...")
+                homing = False
+                status_text = "TRACKING"
 
-            cv2.imshow("Output", img)
-            #if cv2.waitKey(1)&0xFF == ord('q'): break
-            
+            # --- SCANNING MODE ---
+            if not objects and not homing and (time.time() - object_last_seen > 2):
+                if not scanning:
+                    print("[INFO] Starting scan...")
+                    scanning = True
+                status_text = "SCANNING"
+                # simple scan oscillation
+                scan_offset = int(100 * (1 + (time.time() % 4 - 2)))
+                target_scan = (frame_center[0] + scan_offset, frame_center[1])
+                send_coordinates(frame_center, target_scan)
+
+            # --- RELAY TRIGGER ---
+            msg = read_from_arduino()
+            if msg == "ALIGNED":
+                now = time.time()
+                if now - last_trigger_time > COOLDOWN_SECONDS:
+                    trigger_relay(3)
+                    last_trigger_time = now
+
+            # --- STATUS OVERLAY ---
+            cv2.putText(img, f"STATUS: {status_text}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+            cv2.imshow("PawStopper Output", img)
             if cv2.waitKey(1) & 0xFF == ord('q'):
-                print("[INFO] Quitting. Sending robot to home position.")
-                arduino.write(b'HOME\n')
-                #time.sleep(5)  # wait for Arduino to complete movement
+                print("[INFO] Quitting. Going home...")
+                send_coordinates(frame_center, frame_center)
+                time.sleep(2)
                 break
 
-
     except KeyboardInterrupt:
-        print("Interrupted by user")
+        print("[INFO] Stopped by user")
     finally:
         cap.release()
         cv2.destroyAllWindows()
         GPIO.cleanup()
-        arduino.close()
+        if arduino: arduino.close()
+
+# -------------------------------
+# Run
+# -------------------------------
+if __name__ == "__main__":
+    main()
