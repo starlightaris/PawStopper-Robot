@@ -85,6 +85,7 @@ class StepperController:
         self.home_cooldown_active: bool = False
         self._lock = threading.Lock()
         self._homing_complete_event = threading.Event()
+        self._homing_complete_callback = None
         
     def send_step_command(self, axis: str, direction: str, steps: int) -> bool:
         """Send step command to Arduino and wait for confirmation"""
@@ -191,6 +192,10 @@ class StepperController:
         threading.Thread(target=self._go_home_thread, daemon=True).start()
         return True
     
+    def set_homing_complete_callback(self, callback):
+        """Set callback to be called when homing is complete"""
+        self._homing_complete_callback = callback
+    
     def wait_for_homing_complete(self, timeout: float = 30.0) -> bool:
         """Wait for homing to complete with timeout"""
         return self._homing_complete_event.wait(timeout)
@@ -234,6 +239,9 @@ class StepperController:
             if home_success:
                 logger.info(f"Home complete. Final position: ({self.current_pos_x}, {self.current_pos_y})")
                 threading.Thread(target=self._home_cooldown_thread, daemon=True).start()
+                # Call callback if set
+                if self._homing_complete_callback:
+                    self._homing_complete_callback()
             else:
                 logger.error("Homing failed! Position may be inaccurate.")
                 
@@ -610,6 +618,9 @@ class PawStopperRobot:
         self.detector = ObjectDetector(self.config)
         self.scanner = ScanController(self.config, self.stepper)
         
+        # Set up homing callback to reset scanner
+        self.stepper.set_homing_complete_callback(self._on_homing_complete)
+        
         # State variables
         self.object_tracked = False
         self.last_trigger_time = 0
@@ -618,6 +629,13 @@ class PawStopperRobot:
         
         # Initialize camera
         self.cap = self._initialize_camera()
+    
+    def _on_homing_complete(self) -> None:
+        """Callback function called when homing is complete"""
+        logger.info("Homing complete - resetting scanner state")
+        self.scanner.reset_scan()
+        self.object_tracked = False
+        self.lost_since = None
         
     def _initialize_arduino(self) -> serial.Serial:
         """Initialize Arduino serial connection"""
@@ -771,7 +789,10 @@ class PawStopperRobot:
             self.stepper.manual_reset_position(0, 0)
         elif key == ord('h'):
             logger.info("Manual home command")
-            self.stepper.go_home()
+            if self.stepper.go_home():
+                logger.info("Homing initiated - scanner will be reset when complete")
+            else:
+                logger.warning("Failed to start homing")
         elif key == ord('p'):
             info = self.stepper.get_position_info()
             logger.info(f"Current position info: {info}")
