@@ -70,7 +70,7 @@ class Config:
     
     def __post_init__(self):
         if self.TARGET_OBJECTS is None:
-            self.TARGET_OBJECTS = ['cat', 'dog'] #change the object here
+            self.TARGET_OBJECTS = ['cat', 'dog', 'cell phone'] #change the object here
 
 class StepperController:
     """Handles stepper motor control and position tracking"""
@@ -95,7 +95,7 @@ class StepperController:
             with self._lock:
                 # Clear any pending data before sending command
                 self.arduino.reset_input_buffer()
-                time.sleep(0.1)  # Increased delay
+                time.sleep(0.01)  # Reduced from 0.1 to 0.01
                 
                 self.arduino.write(cmd.encode())
                 self.arduino.flush()  # Ensure data is sent
@@ -121,7 +121,7 @@ class StepperController:
                         except UnicodeDecodeError:
                             logger.warning("Received malformed data from Arduino")
                             continue
-                    time.sleep(0.01)
+                    time.sleep(0.001)  # Reduced from 0.01 to 0.001
                 
                 logger.error(f"Timeout waiting for {axis}_OK acknowledgment")
                 logger.debug(f"All responses received: {responses_received}")
@@ -213,7 +213,7 @@ class StepperController:
             # Clear any pending data
             with self._lock:
                 self.arduino.reset_input_buffer()
-                time.sleep(0.2)
+                time.sleep(0.05)  # Reduced from 0.2 to 0.05
             
             # Home Y axis first (usually safer)
             if self.current_pos_y != 0:
@@ -222,7 +222,7 @@ class StepperController:
                 if not home_success:
                     logger.error("Y axis homing failed!")
                     return False
-                time.sleep(0.5)  # Pause between axes
+                time.sleep(0.1)  # Reduced from 0.5 to 0.1
             
             # Then home X axis
             if self.current_pos_x != 0:
@@ -271,7 +271,7 @@ class StepperController:
                 retry_count = 0
                 consecutive_failures = 0
                 logger.debug(f"{axis} homing progress: {steps - remaining_steps}/{steps} steps")
-                time.sleep(0.1)  # Small delay between successful moves
+                time.sleep(0.01)  # Reduced from 0.1 to 0.01
             else:
                 retry_count += 1
                 consecutive_failures += 1
@@ -280,17 +280,17 @@ class StepperController:
                 if consecutive_failures >= 2:
                     # Try to reset communication
                     logger.warning("Multiple consecutive failures, resetting communication...")
-                    time.sleep(0.5)
+                    time.sleep(0.1)  # Reduced from 0.5 to 0.1
                     with self._lock:
                         self.arduino.reset_input_buffer()
                         self.arduino.reset_output_buffer()
-                    time.sleep(0.5)
+                    time.sleep(0.1)  # Reduced from 0.5 to 0.1
                     
                 if retry_count >= self.config.MAX_RETRIES:
                     logger.error(f"{axis} homing failed after maximum retries!")
                     return False
                     
-                time.sleep(0.5)  # Wait before retry
+                time.sleep(0.1)  # Reduced from 0.5 to 0.1
         
         if remaining_steps == 0:
             # Verify position is actually zero
@@ -351,8 +351,7 @@ class StepperController:
             direction = "FORWARD" if error_x > 0 else "BACKWARD"
             if self.step_x(direction, x_step_size):
                 moved = True
-                # Reduce stabilization delay to minimize lag
-                time.sleep(0.005)
+                time.sleep(0.01)  # Reduced from 0.05 to 0.01
         
         # Move Y axis if error is above tolerance with proportional step size
         y_step_size = calculate_step_size(error_y, "Y")
@@ -360,15 +359,15 @@ class StepperController:
             direction = "FORWARD" if error_y > 0 else "BACKWARD"
             if self.step_y(direction, y_step_size):
                 moved = True
-                time.sleep(0.005)  # Small delay after movement to stabilize
+                time.sleep(0.01)  # Reduced from 0.05 to 0.01
         
         # Check if aligned
         aligned = abs(error_x) <= self.tolerance and abs(error_y) <= self.tolerance
         if aligned:
             logger.debug("ALIGNED")
         elif moved:
-            # Keep short pause only if we moved to avoid jitter
-            time.sleep(0.01)
+            # If we made movements, give a brief pause to let the system stabilize
+            time.sleep(0.01)  # Reduced from 0.1 to 0.01
             
         return aligned, moved
     
@@ -459,23 +458,25 @@ class RelayController:
         self.alarm = AlarmController(self.config)
         
     def trigger_relay(self, duration: int = None) -> None:
-        """Trigger relay for specified duration"""
+        """Trigger relay for specified duration - NON-BLOCKING VERSION"""
         if duration is None:
             duration = self.config.RELAY_DURATION
             
-        logger.info("Relay ON")
-        GPIO.output(self.relay_pin, GPIO.LOW)
-        self.alarm.alarm_on()
-        time.sleep(duration)
-        GPIO.output(self.relay_pin, GPIO.HIGH)
-        self.alarm.alarm_off()
-        logger.info("Relay OFF")
+        def relay_operation():
+            logger.info("Relay ON")
+            GPIO.output(self.relay_pin, GPIO.LOW)
+            self.alarm.alarm_on()
+            time.sleep(duration)
+            GPIO.output(self.relay_pin, GPIO.HIGH)
+            self.alarm.alarm_off()
+            logger.info("Relay OFF")
+        
+        # Run in separate thread to avoid blocking
+        threading.Thread(target=relay_operation, daemon=True).start()
     
     def trigger_relay_async(self, duration: int = None) -> None:
-        """Trigger relay asynchronously"""
-        if duration is None:
-            duration = self.config.RELAY_DURATION
-        threading.Thread(target=self.trigger_relay, args=(duration,), daemon=True).start()
+        """Trigger relay asynchronously - alias for consistency"""
+        self.trigger_relay(duration)
 
 class AlarmController:
     """Handles alarm system control"""
@@ -744,8 +745,8 @@ class PawStopperRobot:
                 
                 self.last_trigger_time = current_time
                 
-                # Short delay after triggering to avoid immediate movement, but keep UI responsive
-                time.sleep(0.05)
+                # Add a small delay after triggering to avoid immediate movement
+                time.sleep(0.01)  # Reduced from 0.2 to 0.01
             
             return True
         
