@@ -61,7 +61,6 @@ class Config:
     CAMERA_WIDTH: int = 640
     CAMERA_HEIGHT: int = 480
     INPUT_SIZE: Tuple[int, int] = (320, 320)
-    CAMERA_FPS: int = 30  # NEW
     
     # File Paths
     COCO_NAMES_PATH: str = "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/coco.names"
@@ -515,12 +514,6 @@ class ObjectDetector:
         """Initialize the detection model"""
         try:
             net = cv2.dnn_DetectionModel(self.config.MODEL_PATH, self.config.CONFIG_PATH)
-            # Explicit backend/target for consistency and perf
-            try:
-                net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-                net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-            except Exception:
-                pass
             net.setInputSize(*self.config.INPUT_SIZE)
             net.setInputScale(1.0/127.5)
             net.setInputMean((127.5, 127.5, 127.5))
@@ -660,22 +653,6 @@ class PawStopperRobot:
             cap = cv2.VideoCapture(0)
             cap.set(3, self.config.CAMERA_WIDTH)
             cap.set(4, self.config.CAMERA_HEIGHT)
-            # Reduce internal buffering if supported
-            try:
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except Exception:
-                pass
-            # Try to set FPS (may be ignored on some platforms)
-            try:
-                if self.config.CAMERA_FPS > 0:
-                    cap.set(cv2.CAP_PROP_FPS, self.config.CAMERA_FPS)
-            except Exception:
-                pass
-            # Warm up and drop initial frames
-            warmup_until = time.time() + 0.5
-            while time.time() < warmup_until:
-                cap.read()
-                time.sleep(0.005)
             logger.info("Camera initialized successfully")
             return cap
         except Exception as e:
@@ -807,12 +784,6 @@ class PawStopperRobot:
         
         try:
             while True:
-                # Drop a couple of queued frames (if any) to keep feed fresh
-                try:
-                    for _ in range(2):
-                        self.cap.grab()
-                except Exception:
-                    pass
                 success, img = self.cap.read()
                 if not success:
                     logger.error("Failed to read from camera")
