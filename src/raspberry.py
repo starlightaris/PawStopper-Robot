@@ -1,15 +1,11 @@
-# =========================================
-# PawStopper Robot - Clean Full Behavior
-# =========================================
 import cv2
 import RPi.GPIO as GPIO
 import serial
 import time
 import threading
 
-# -------------------------------
 # Arduino Serial Setup
-# -------------------------------
+
 try:
     arduino = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
     time.sleep(2)
@@ -18,9 +14,8 @@ except Exception as e:
     print(f"[ERROR] Failed to connect to Arduino: {e}")
     arduino = None
 
-# -------------------------------
 # GPIO Setup
-# -------------------------------
+
 GPIO.setmode(GPIO.BCM)
 
 RELAY_PIN = 17
@@ -43,9 +38,8 @@ def alarm_on():
 def alarm_off():
     GPIO.output(ALARM_PIN, GPIO.LOW)
 
-# -------------------------------
 # Object Detection Setup
-# -------------------------------
+
 classNames = []
 with open("/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/coco.names", "rt") as f:
     classNames = f.read().rstrip("\n").split("\n")
@@ -64,9 +58,8 @@ AREA_THRESHOLD = 15000
 COOLDOWN_SECONDS = 10
 OBJECT_LOST_TIMEOUT = 5
 
-# -------------------------------
 # Object Detection
-# -------------------------------
+
 def getObjects(img, thres, nms, draw=True, objects=[]):
     classIds, confs, bbox = net.detect(img, confThreshold=thres, nmsThreshold=nms)
     objectInfo = []
@@ -86,14 +79,43 @@ def getObjects(img, thres, nms, draw=True, objects=[]):
                     cv2.circle(img, (cx, cy), 5, (0,255,0), -1)
     return img, objectInfo
 
+# Arduino Communication (Modified)
 # -------------------------------
-# Arduino Communication
-# -------------------------------
-def send_coordinates(frame_center, target_center):
-    if arduino is None: return
-    data = f"{frame_center[0]},{frame_center[1]},{target_center[0]},{target_center[1]}\n"
-    arduino.write(data.encode())
-    print(f"[TX] {data.strip()}")
+def send_step(axis: str, direction: str, steps: int):
+    if arduino is None: 
+        return
+    cmd = f"STEP {axis} {direction} {steps}\n"
+    arduino.write(cmd.encode())
+    print(f"[TX] {cmd.strip()}")
+
+    reply = arduino.readline().decode(errors="ignore").strip()
+    if reply:
+        print(f"[RX] {reply}")
+    return reply
+
+def move_to_target(frame_center, target_center, deadzone=30, step_size=5):
+    """
+    Compare target position to frame center, send STEP commands.
+    """
+    if arduino is None: 
+        return
+
+    errorX = target_center[0] - frame_center[0]
+    errorY = target_center[1] - frame_center[1]
+
+    # Horizontal
+    if abs(errorX) > deadzone:
+        if errorX > 0:
+            send_step("X", "FORWARD", step_size)
+        else:
+            send_step("X", "BACKWARD", step_size)
+
+    # Vertical
+    if abs(errorY) > deadzone:
+        if errorY > 0:
+            send_step("Y", "FORWARD", step_size)
+        else:
+            send_step("Y", "BACKWARD", step_size)
 
 def read_from_arduino():
     if not arduino:
@@ -171,7 +193,7 @@ def main():
 
                 if biggest_box:
                     _, target_center = biggest_box
-                    send_coordinates(frame_center, target_center)
+                    move_to_target(frame_center, target_center)
                     alarm_on()
                     object_last_seen = time.time()
                     scanning = False
@@ -190,7 +212,8 @@ def main():
                     homing = True
                     scanning = False
                     status_text = "HOMING"
-                    send_coordinates(frame_center, frame_center)
+                    move_to_target(frame_center, frame_center, deadzone=0, step_size=10)
+
 
             # --- INTERRUPT HOMING ---
             if homing and objects:
@@ -206,7 +229,8 @@ def main():
                 status_text = "SCANNING"
                 scan_offset = int(100 * (1 + (time.time() % 4 - 2)))
                 target_scan = (frame_center[0] + scan_offset, frame_center[1])
-                send_coordinates(frame_center, target_scan)
+                move_to_target(frame_center, frame_center, deadzone=0, step_size=10)
+
 
             # --- RELAY TRIGGER ---
             msg = read_from_arduino()
@@ -223,7 +247,7 @@ def main():
             cv2.imshow("PawStopper Output", img)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 print("[INFO] Quitting. Going home...")
-                send_coordinates(frame_center, frame_center)
+                move_to_target(frame_center, frame_center, deadzone=0, step_size=10)
                 time.sleep(2)
                 break
 
