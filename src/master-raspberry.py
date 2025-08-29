@@ -28,8 +28,8 @@ CONFIG = {
     'SCAN_LIMIT_STEPS': 1024,
     'SCAN_STEP_SIZE': 10,
     'SCAN_STEP_DELAY': 0.1,
-    'HOMING_SPEED': 20,           # Steps per second for automatic homing
-    'FAST_HOMING_SPEED': 100,     # Steps per second for manual homing
+    'HOMING_SPEED': 50,           # Steps per second for automatic homing
+    'FAST_HOMING_SPEED': 50,     # Steps per second for manual homing
     'AREA_THRESHOLD': 15000,
     'CONFIDENCE_THRESHOLD': 0.45,
     'NMS_THRESHOLD': 0.2,
