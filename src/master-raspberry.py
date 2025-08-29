@@ -29,7 +29,7 @@ CONFIG = {
     'SCAN_STEP_SIZE': 10,
     'SCAN_STEP_DELAY': 0.1,
     'HOMING_SPEED': 50,           # Steps per second for automatic homing
-    'FAST_HOMING_SPEED': 50,     # Steps per second for manual homing
+    'FAST_HOMING_SPEED': 50,     # Steps per second for manual homing; basically bigger chunk
     'AREA_THRESHOLD': 15000,
     'CONFIDENCE_THRESHOLD': 0.45,
     'NMS_THRESHOLD': 0.2,
@@ -43,7 +43,7 @@ CONFIG = {
     'COCO_NAMES_PATH': "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/coco.names",
     'MODEL_PATH': "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/frozen_inference_graph.pb",
     'CONFIG_PATH': "/home/eutech/Desktop/PawStopper-Robot/Object_Detection_Files/ssd_mobilenet_v3_large_coco_2020_01_14.pbtxt",
-    'TARGET_OBJECTS': ['cat', 'dog', 'cell phone']
+    'TARGET_OBJECTS': ['cat', 'dog', 'cell phone'] # CHANGE OBJ HEREE!
 }
 
 # Global state
@@ -78,7 +78,7 @@ except Exception as e:
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(CONFIG['RELAY_PIN'], GPIO.OUT)
 GPIO.setup(CONFIG['ALARM_PIN'], GPIO.OUT)
-GPIO.output(CONFIG['RELAY_PIN'], GPIO.HIGH)  # Initially off
+GPIO.output(CONFIG['RELAY_PIN'], GPIO.HIGH)  # Initially off; here high = 0, low =1 (temp fix)
 GPIO.output(CONFIG['ALARM_PIN'], GPIO.LOW)
 
 # Object Detection Setup
@@ -197,33 +197,51 @@ def step_y(direction, steps):
         return True
     return False
 
-def step_x_with_delay(direction, steps, delay=0.01):
-    """Move X axis with delay between steps"""
+def step_x_with_delay(direction, steps, delay=0.01, chunk_size=1):
+    """Move X axis with delay between chunks"""
     success = True
-    for i in range(steps):
-        # Check if we should interrupt homing for object detection
+    remaining_steps = steps
+    
+    while remaining_steps > 0:
+        # Checking if homing should be interruptted for object detection
         if state['is_homing'] and not state['manual_homing'] and state['object_tracked']:
             logger.info("Object detected during homing - interrupting homing")
             return False  # Interrupt homing
             
-        if not step_x(direction, 1):
+        # Move in chunks
+        current_chunk = min(chunk_size, remaining_steps)
+        
+        if not step_x(direction, current_chunk):
             success = False
+            break
+            
+        remaining_steps -= current_chunk
         time.sleep(delay)
+        
     return success
 
-def step_y_with_delay(direction, steps, delay=0.01):
-    """Move Y axis with delay between steps"""
+def step_y_with_delay(direction, steps, delay=0.01, chunk_size=1):
+    """Move Y axis with delay between chunks"""
     success = True
-    for i in range(steps):
-        # Check if we should interrupt homing for object detection
+    remaining_steps = steps
+    
+    while remaining_steps > 0:
+        # Checking if homing should be interruptted for object detection
         if state['is_homing'] and not state['manual_homing'] and state['object_tracked']:
             logger.info("Object detected during homing - interrupting homing")
             return False  # Interrupt homing
             
-        if not step_y(direction, 1):
+        # Move in chunks
+        current_chunk = min(chunk_size, remaining_steps)
+        
+        if not step_y(direction, current_chunk):
             success = False
+            break
+            
+        remaining_steps -= current_chunk
         time.sleep(delay)
-    return success
+        
+    return True
 
 # Relay and Alarm Functions
 def trigger_relay(duration=None):
@@ -384,21 +402,23 @@ def home_axis(axis, current_pos, manual=False):
     
     # Use different speeds for manual vs automatic homing
     if manual:
-        homing_speed = CONFIG['FAST_HOMING_SPEED']
-        logger.info(f"Fast homing {axis} axis: {steps} steps {direction}")
+        homing_speed = CONFIG['FAST_HOMING_SPEED']  # 50 steps/sec
+        chunk_size = 50  # BIG chunks for fast manual homing
+        logger.info(f"Fast homing {axis} axis: {steps} steps {direction} (chunk size: {chunk_size})")
     else:
-        homing_speed = CONFIG['HOMING_SPEED']
-        logger.info(f"Homing {axis} axis: {steps} steps {direction}")
+        homing_speed = CONFIG['HOMING_SPEED']  # 50 steps/sec  
+        chunk_size = 10   # Smaller chunks for automatic homing
+        logger.info(f"Homing {axis} axis: {steps} steps {direction} (chunk size: {chunk_size})")
     
-    # Calculate delay for homing speed
+    # Calculate delay for homing speed (delay between chunks)
     delay = 1.0 / homing_speed
     
     if axis == "X":
-        success = step_x_with_delay(direction, steps, delay)
+        success = step_x_with_delay(direction, steps, delay, chunk_size)
         if success:
             state['current_pos_x'] = 0
     else:
-        success = step_y_with_delay(direction, steps, delay)
+        success = step_y_with_delay(direction, steps, delay, chunk_size)
         if success:
             state['current_pos_y'] = 0
             
@@ -500,7 +520,7 @@ def main():
                 
                 aligned, moved = track_object(frame_center, bbox_center)
                 
-                alarm_on()
+                # alarm_on() # distrubing, so removing (temp)
                 state['object_tracked'] = True
                 state['lost_since'] = None
                 
@@ -560,6 +580,8 @@ def main():
                 state['quitting'] = True
                 if not state['is_homing']:
                     go_home(manual=True)  # Fast manual homing for quit
+                while state['is_homing']:
+                    time.sleep(0.1)
                 break
             elif key == ord('r'):
                 logger.info("Manually resetting position to (0,0)")
