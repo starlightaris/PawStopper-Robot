@@ -29,25 +29,27 @@ void loop() {
         // Validate steps
         if (steps <= 0 || steps > 1000) {
           Serial.println("ERROR: Invalid step count");
-          continue;
-        }
+        } else {
+          int dir = (dirStr == "FORWARD") ? FORWARD : BACKWARD;
 
-        int dir = (dirStr == "FORWARD") ? FORWARD : BACKWARD;
-
-        if (axis == "X") {
-          stepperX.step(steps, dir, SINGLE);
-          Serial.println("X_OK");
-        }
-        else if (axis == "Y") {
-          stepperY.step(steps, dir, SINGLE);
-          Serial.println("Y_OK");
-        }
-        else {
-          Serial.println("ERROR: Invalid axis");
+          if (axis == "X") {
+            stepperX.step(steps, dir, SINGLE);
+            Serial.println("X_OK");
+          }
+          else if (axis == "Y") {
+            stepperY.step(steps, dir, SINGLE);
+            Serial.println("Y_OK");
+          }
+          else {
+            Serial.println("ERROR: Invalid axis");
+          }
         }
       } else {
         Serial.println("ERROR: Invalid command format");
       }
     }
   }
+  
+  // Small delay to prevent overwhelming the serial buffer
+  delay(10);
 }

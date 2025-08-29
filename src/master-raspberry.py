@@ -18,7 +18,7 @@ CONFIG = {
     'ARDUINO_PORT': '/dev/ttyUSB0',
     'ARDUINO_BAUDRATE': 9600,
     'SERIAL_TIMEOUT': 1.0,
-    'COMMAND_TIMEOUT': 2.0,  # Added missing parameter
+    'COMMAND_TIMEOUT': 2.0,
     'RELAY_PIN': 17,
     'ALARM_PIN': 18,
     'TOLERANCE': 15,
@@ -27,8 +27,9 @@ CONFIG = {
     'MAX_RETRIES': 3,
     'SCAN_LIMIT_STEPS': 1024,
     'SCAN_STEP_SIZE': 10,
-    'SCAN_STEP_DELAY': 0.1,  # Added to control scan speed
-    'HOMING_SPEED': 20,      # Steps per second for homing
+    'SCAN_STEP_DELAY': 0.1,
+    'HOMING_SPEED': 20,           # Steps per second for automatic homing
+    'FAST_HOMING_SPEED': 100,     # Steps per second for manual homing
     'AREA_THRESHOLD': 15000,
     'CONFIDENCE_THRESHOLD': 0.45,
     'NMS_THRESHOLD': 0.2,
@@ -56,10 +57,8 @@ state = {
     'home_cooldown_active': False,
     'scan_direction': "FORWARD",
     'scan_steps': 0,
-    'known_home_x': 0,  # Track known home position
-    'known_home_y': 0,  # Track known home position
-    'max_steps_x': 2000,  # Estimated maximum steps for X axis
-    'max_steps_y': 2000,  # Estimated maximum steps for Y axis
+    'manual_homing': False,      # Track if homing was manually triggered
+    'quitting': False            # Track if quitting was requested
 }
 
 # Arduino Serial Setup
@@ -93,17 +92,36 @@ net.setInputScale(1.0 / 127.5)
 net.setInputMean((127.5, 127.5, 127.5))
 net.setInputSwapRB(True)
 
-# Arduino Communication Functions
+# Serial Communication Functions
+def check_serial_connection():
+    """Check if serial connection is still active, reconnect if needed"""
+    global arduino
+    if arduino is None or not arduino.is_open:
+        try:
+            arduino = serial.Serial(
+                CONFIG['ARDUINO_PORT'], 
+                CONFIG['ARDUINO_BAUDRATE'], 
+                timeout=CONFIG['SERIAL_TIMEOUT']
+            )
+            time.sleep(2)
+            logger.info("Reconnected to Arduino successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to reconnect to Arduino: {e}")
+            return False
+    return True
+
 def send_command(cmd, expected_response=None):
     """Send command to Arduino and wait for response"""
-    if arduino is None:
-        logger.error("Arduino not connected")
+    if not check_serial_connection():
         return False
         
     try:
+        # Clear any leftover data in the buffer
         arduino.reset_input_buffer()
-        time.sleep(0.01)
+        time.sleep(0.02)
         
+        # Send the command
         arduino.write(cmd.encode())
         arduino.flush()
         logger.debug(f"Sent: {cmd.strip()}")
@@ -112,23 +130,36 @@ def send_command(cmd, expected_response=None):
         if expected_response is None:
             return True
             
-        # Wait for acknowledgment
+        # Wait for acknowledgment with timeout
         start_time = time.time()
+        response = ""
+        
         while time.time() - start_time < CONFIG['COMMAND_TIMEOUT']:
             if arduino.in_waiting > 0:
-                response = arduino.readline().decode().strip()
-                if response:
-                    logger.debug(f"Arduino response: '{response}'")
-                    if response == expected_response:
-                        return True
-                    elif response.endswith("_ERROR"):
-                        logger.error(f"Arduino reported error: {response}")
-                        return False
+                # Read one byte at a time to avoid partial reads
+                byte = arduino.read(1)
+                if byte:
+                    response += byte.decode('utf-8', errors='ignore')
+                    # Check if we have a complete line
+                    if '\n' in response:
+                        response = response.strip()
+                        logger.debug(f"Arduino response: '{response}'")
+                        
+                        if response == expected_response:
+                            return True
+                        elif response.endswith("_ERROR"):
+                            logger.error(f"Arduino reported error: {response}")
+                            return False
+                        # If we got a response but not the expected one, continue waiting
+                        response = ""  # Reset for next response
             time.sleep(0.001)
         
-        logger.error(f"Timeout waiting for {expected_response} acknowledgment")
+        logger.error(f"Timeout waiting for {expected_response}. No valid response received.")
         return False
         
+    except serial.SerialException as e:
+        logger.error(f"Serial communication error: {e}")
+        return False
     except Exception as e:
         logger.error(f"Error sending command: {e}")
         return False
@@ -140,6 +171,9 @@ def send_step_command(axis, direction, steps):
 
 def step_x(direction, steps):
     """Move X axis and update position tracking"""
+    if not check_serial_connection():
+        return False
+        
     logger.debug(f"Moving X axis: {direction} {steps} steps")
     if send_step_command("X", direction, steps):
         if direction == "FORWARD":
@@ -151,6 +185,9 @@ def step_x(direction, steps):
 
 def step_y(direction, steps):
     """Move Y axis and update position tracking"""
+    if not check_serial_connection():
+        return False
+        
     logger.debug(f"Moving Y axis: {direction} {steps} steps")
     if send_step_command("Y", direction, steps):
         if direction == "FORWARD":
@@ -163,7 +200,12 @@ def step_y(direction, steps):
 def step_x_with_delay(direction, steps, delay=0.01):
     """Move X axis with delay between steps"""
     success = True
-    for _ in range(steps):
+    for i in range(steps):
+        # Check if we should interrupt homing for object detection
+        if state['is_homing'] and not state['manual_homing'] and state['object_tracked']:
+            logger.info("Object detected during homing - interrupting homing")
+            return False  # Interrupt homing
+            
         if not step_x(direction, 1):
             success = False
         time.sleep(delay)
@@ -172,7 +214,12 @@ def step_x_with_delay(direction, steps, delay=0.01):
 def step_y_with_delay(direction, steps, delay=0.01):
     """Move Y axis with delay between steps"""
     success = True
-    for _ in range(steps):
+    for i in range(steps):
+        # Check if we should interrupt homing for object detection
+        if state['is_homing'] and not state['manual_homing'] and state['object_tracked']:
+            logger.info("Object detected during homing - interrupting homing")
+            return False  # Interrupt homing
+            
         if not step_y(direction, 1):
             success = False
         time.sleep(delay)
@@ -284,52 +331,67 @@ def track_object(frame_center, object_center):
     
     return aligned, moved
 
-def go_home():
+def go_home(manual=False):
     """Return both axes to logical zero position (async)"""
     if state['is_homing']:
         logger.warning("Homing already in progress...")
         return False
     
-    logger.info(f"Starting homing from position: ({state['current_pos_x']}, {state['current_pos_y']})")
+    logger.info(f"Starting {'manual ' if manual else ''}homing from position: ({state['current_pos_x']}, {state['current_pos_y']})")
     state['is_homing'] = True
+    state['manual_homing'] = manual
     
     def home_thread():
         try:
             # Home Y axis first
             if state['current_pos_y'] != 0:
                 logger.info("Homing Y axis...")
-                home_axis("Y", state['current_pos_y'])
+                home_axis("Y", state['current_pos_y'], manual)
             
             # Then home X axis
             if state['current_pos_x'] != 0:
                 logger.info("Homing X axis...")
-                home_axis("X", state['current_pos_x'])
+                home_axis("X", state['current_pos_x'], manual)
             
             logger.info(f"Home complete. Final position: ({state['current_pos_x']}, {state['current_pos_y']})")
             
-            # Start home cooldown
-            state['home_cooldown_active'] = True
-            logger.info(f"Starting {CONFIG['HOME_COOLDOWN_SECONDS']}-second home cooldown...")
-            time.sleep(CONFIG['HOME_COOLDOWN_SECONDS'])
-            state['home_cooldown_active'] = False
-            logger.info("Home cooldown complete")
+            # Start home cooldown only for automatic homing
+            if not manual:
+                state['home_cooldown_active'] = True
+                logger.info(f"Starting {CONFIG['HOME_COOLDOWN_SECONDS']}-second home cooldown...")
+                time.sleep(CONFIG['HOME_COOLDOWN_SECONDS'])
+                state['home_cooldown_active'] = False
+                logger.info("Home cooldown complete")
             
         except Exception as e:
             logger.error(f"Exception during homing: {e}")
         finally:
             state['is_homing'] = False
+            state['manual_homing'] = False
+            
+            # If quitting, set flag to exit
+            if state['quitting']:
+                global running
+                running = False
     
     threading.Thread(target=home_thread, daemon=True).start()
     return True
 
-def home_axis(axis, current_pos):
+def home_axis(axis, current_pos, manual=False):
     """Home a single axis using software tracking"""
     direction = "BACKWARD" if current_pos > 0 else "FORWARD"
     steps = abs(current_pos)
-    logger.info(f"Homing {axis} axis: {steps} steps {direction}")
+    
+    # Use different speeds for manual vs automatic homing
+    if manual:
+        homing_speed = CONFIG['FAST_HOMING_SPEED']
+        logger.info(f"Fast homing {axis} axis: {steps} steps {direction}")
+    else:
+        homing_speed = CONFIG['HOMING_SPEED']
+        logger.info(f"Homing {axis} axis: {steps} steps {direction}")
     
     # Calculate delay for homing speed
-    delay = 1.0 / CONFIG['HOMING_SPEED']
+    delay = 1.0 / homing_speed
     
     if axis == "X":
         success = step_x_with_delay(direction, steps, delay)
@@ -344,7 +406,7 @@ def home_axis(axis, current_pos):
         logger.info(f"{axis} axis homed successfully")
         return True
     else:
-        logger.error(f"{axis} homing failed!")
+        logger.info(f"{axis} homing interrupted for object tracking")
         return False
 
 def perform_scan_step():
@@ -360,7 +422,7 @@ def perform_scan_step():
             state['scan_steps'] = 0
             logger.info(f"Scan direction changed to: {state['scan_direction']}")
         
-        time.sleep(CONFIG['SCAN_STEP_DELAY'])  # Added delay to control scan speed
+        time.sleep(CONFIG['SCAN_STEP_DELAY'])
         return True
     return False
 
@@ -389,6 +451,9 @@ def display_ui_info(img):
 
 # Main Function
 def main():
+    global running
+    running = True
+    
     cap = cv2.VideoCapture(0)
     cap.set(3, CONFIG['CAMERA_WIDTH'])
     cap.set(4, CONFIG['CAMERA_HEIGHT'])
@@ -397,11 +462,12 @@ def main():
     logger.info(f"Camera ready: {CONFIG['CAMERA_WIDTH']}x{CONFIG['CAMERA_HEIGHT']}")
     
     try:
-        while True:
+        while running:
             success, img = cap.read()
             if not success:
                 logger.error("Failed to read from camera")
-                break
+                check_serial_connection()
+                continue
             
             display_ui_info(img)
             
@@ -425,6 +491,13 @@ def main():
             
             if biggest_box is not None:
                 box, bbox_center = biggest_box
+                
+                # If object detected during manual homing, cancel homing
+                if state['is_homing'] and state['manual_homing']:
+                    logger.info("Object detected during manual homing - cancelling homing")
+                    state['is_homing'] = False
+                    state['manual_homing'] = False
+                
                 aligned, moved = track_object(frame_center, bbox_center)
                 
                 alarm_on()
@@ -467,7 +540,7 @@ def main():
                         
                         if remaining <= 0:
                             logger.info("Countdown complete, initiating home sequence...")
-                            if go_home():
+                            if go_home(manual=False):  # Automatic homing
                                 state['object_tracked'] = False
                                 state['lost_since'] = None
                                 reset_scan()
@@ -484,11 +557,9 @@ def main():
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 logger.info("Quitting. Going home...")
-                # Go home before quitting
+                state['quitting'] = True
                 if not state['is_homing']:
-                    go_home()
-                    # Wait a bit for homing to start
-                    time.sleep(1)
+                    go_home(manual=True)  # Fast manual homing for quit
                 break
             elif key == ord('r'):
                 logger.info("Manually resetting position to (0,0)")
@@ -496,7 +567,7 @@ def main():
                 state['current_pos_y'] = 0
             elif key == ord('h'):
                 logger.info("Manual home command")
-                go_home()
+                go_home(manual=True)  # Fast manual homing
             elif key == ord('p'):
                 logger.info(f"Current position: X={state['current_pos_x']}, Y={state['current_pos_y']}")
                 
@@ -506,10 +577,11 @@ def main():
         logger.error(f"Unexpected error: {e}")
     finally:
         # Cleanup
+        running = False
         cap.release()
         cv2.destroyAllWindows()
         GPIO.cleanup()
-        if arduino:
+        if arduino and arduino.is_open:
             arduino.close()
         logger.info("Cleanup complete")
 
