@@ -10,6 +10,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+
 logger = logging.getLogger(__name__)
 
 # Configuration
@@ -17,6 +18,7 @@ CONFIG = {
     'ARDUINO_PORT': '/dev/ttyUSB0',
     'ARDUINO_BAUDRATE': 9600,
     'SERIAL_TIMEOUT': 1.0,
+    'COMMAND_TIMEOUT': 2.0,  # Added missing parameter
     'RELAY_PIN': 17,
     'ALARM_PIN': 18,
     'TOLERANCE': 15,
@@ -25,6 +27,8 @@ CONFIG = {
     'MAX_RETRIES': 3,
     'SCAN_LIMIT_STEPS': 1024,
     'SCAN_STEP_SIZE': 10,
+    'SCAN_STEP_DELAY': 0.1,  # Added to control scan speed
+    'HOMING_SPEED': 20,      # Steps per second for homing
     'AREA_THRESHOLD': 15000,
     'CONFIDENCE_THRESHOLD': 0.45,
     'NMS_THRESHOLD': 0.2,
@@ -51,7 +55,11 @@ state = {
     'is_homing': False,
     'home_cooldown_active': False,
     'scan_direction': "FORWARD",
-    'scan_steps': 0
+    'scan_steps': 0,
+    'known_home_x': 0,  # Track known home position
+    'known_home_y': 0,  # Track known home position
+    'max_steps_x': 2000,  # Estimated maximum steps for X axis
+    'max_steps_y': 2000,  # Estimated maximum steps for Y axis
 }
 
 # Arduino Serial Setup
@@ -86,13 +94,12 @@ net.setInputMean((127.5, 127.5, 127.5))
 net.setInputSwapRB(True)
 
 # Arduino Communication Functions
-def send_step_command(axis, direction, steps):
-    """Send step command to Arduino and wait for confirmation"""
+def send_command(cmd, expected_response=None):
+    """Send command to Arduino and wait for response"""
     if arduino is None:
+        logger.error("Arduino not connected")
         return False
         
-    cmd = f"STEP {axis} {direction} {steps}\n"
-    
     try:
         arduino.reset_input_buffer()
         time.sleep(0.01)
@@ -101,6 +108,10 @@ def send_step_command(axis, direction, steps):
         arduino.flush()
         logger.debug(f"Sent: {cmd.strip()}")
         
+        # If no expected response, return success
+        if expected_response is None:
+            return True
+            
         # Wait for acknowledgment
         start_time = time.time()
         while time.time() - start_time < CONFIG['COMMAND_TIMEOUT']:
@@ -108,19 +119,24 @@ def send_step_command(axis, direction, steps):
                 response = arduino.readline().decode().strip()
                 if response:
                     logger.debug(f"Arduino response: '{response}'")
-                    if response == f"{axis}_OK":
+                    if response == expected_response:
                         return True
                     elif response.endswith("_ERROR"):
                         logger.error(f"Arduino reported error: {response}")
                         return False
             time.sleep(0.001)
         
-        logger.error(f"Timeout waiting for {axis}_OK acknowledgment")
+        logger.error(f"Timeout waiting for {expected_response} acknowledgment")
         return False
         
     except Exception as e:
-        logger.error(f"Error sending step command: {e}")
+        logger.error(f"Error sending command: {e}")
         return False
+
+def send_step_command(axis, direction, steps):
+    """Send step command to Arduino and wait for confirmation"""
+    cmd = f"STEP {axis} {direction} {steps}\n"
+    return send_command(cmd, f"{axis}_OK")
 
 def step_x(direction, steps):
     """Move X axis and update position tracking"""
@@ -143,6 +159,24 @@ def step_y(direction, steps):
             state['current_pos_y'] -= steps
         return True
     return False
+
+def step_x_with_delay(direction, steps, delay=0.01):
+    """Move X axis with delay between steps"""
+    success = True
+    for _ in range(steps):
+        if not step_x(direction, 1):
+            success = False
+        time.sleep(delay)
+    return success
+
+def step_y_with_delay(direction, steps, delay=0.01):
+    """Move Y axis with delay between steps"""
+    success = True
+    for _ in range(steps):
+        if not step_y(direction, 1):
+            success = False
+        time.sleep(delay)
+    return success
 
 # Relay and Alarm Functions
 def trigger_relay(duration=None):
@@ -289,40 +323,28 @@ def go_home():
     return True
 
 def home_axis(axis, current_pos):
-    """Home a single axis"""
+    """Home a single axis using software tracking"""
     direction = "BACKWARD" if current_pos > 0 else "FORWARD"
     steps = abs(current_pos)
     logger.info(f"Homing {axis} axis: {steps} steps {direction}")
     
-    remaining_steps = steps
-    retry_count = 0
+    # Calculate delay for homing speed
+    delay = 1.0 / CONFIG['HOMING_SPEED']
     
-    while remaining_steps > 0 and retry_count < CONFIG['MAX_RETRIES']:
-        chunk_steps = min(remaining_steps, CONFIG['MAX_CHUNK_SIZE'])
-        
-        if axis == "X":
-            success = step_x(direction, chunk_steps)
-        else:
-            success = step_y(direction, chunk_steps)
-            
+    if axis == "X":
+        success = step_x_with_delay(direction, steps, delay)
         if success:
-            remaining_steps -= chunk_steps
-            retry_count = 0
-            time.sleep(0.01)
-        else:
-            retry_count += 1
-            logger.warning(f"{axis} step failed! Retry {retry_count}/{CONFIG['MAX_RETRIES']}")
-            time.sleep(0.1)
-    
-    if remaining_steps == 0:
-        if axis == "X":
             state['current_pos_x'] = 0
-        else:
+    else:
+        success = step_y_with_delay(direction, steps, delay)
+        if success:
             state['current_pos_y'] = 0
+            
+    if success:
         logger.info(f"{axis} axis homed successfully")
         return True
     else:
-        logger.error(f"{axis} homing incomplete! {remaining_steps} steps remaining")
+        logger.error(f"{axis} homing failed!")
         return False
 
 def perform_scan_step():
@@ -338,6 +360,7 @@ def perform_scan_step():
             state['scan_steps'] = 0
             logger.info(f"Scan direction changed to: {state['scan_direction']}")
         
+        time.sleep(CONFIG['SCAN_STEP_DELAY'])  # Added delay to control scan speed
         return True
     return False
 
@@ -461,6 +484,11 @@ def main():
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 logger.info("Quitting. Going home...")
+                # Go home before quitting
+                if not state['is_homing']:
+                    go_home()
+                    # Wait a bit for homing to start
+                    time.sleep(1)
                 break
             elif key == ord('r'):
                 logger.info("Manually resetting position to (0,0)")
@@ -474,6 +502,8 @@ def main():
                 
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
     finally:
         # Cleanup
         cap.release()
