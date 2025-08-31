@@ -5,7 +5,7 @@ AF_Stepper stepperY(48, 1); // vertical tilt
 
 void setup() {
   Serial.begin(9600);
-  stepperX.setSpeed(50);  //RPM
+  stepperX.setSpeed(50);
   stepperY.setSpeed(50); 
   Serial.println("Arduino ready");
 }
@@ -15,7 +15,7 @@ void loop() {
     String data = Serial.readStringUntil('\n');
     data.trim();
 
-    // Expected format: STEP X FORWARD 5 or STEP Y BACKWARD 10
+    //FORAMT: STEP X FORWARD 10 or STEP Y BACKWARD 10
     if (data.startsWith("STEP")) {
       int firstSpace = data.indexOf(' ');
       int secondSpace = data.indexOf(' ', firstSpace + 1);

@@ -1,8 +1,3 @@
-"""
-PawStopper Robot - Automated Pet Deterrent System
-Main control module for Raspberry Pi with Arduino stepper motor communication
-"""
-
 # Imports
 import cv2
 import RPi.GPIO as GPIO
@@ -20,11 +15,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configuration Constants
+# Configurations
 @dataclass
 class Config:
-    """Configuration settings for the PawStopper robot"""
-    
+   
     # Serial Communication
     ARDUINO_PORT: str = '/dev/ttyUSB0'
     ARDUINO_BAUDRATE: int = 9600
@@ -36,7 +30,7 @@ class Config:
     ALARM_PIN: int = 18
     
     # Stepper Motor Settings
-    DEFAULT_TOLERANCE: int = 15  # Increase to 20-25 to reduce oscillation if needed
+    DEFAULT_TOLERANCE: int = 15 # pixels
     DEFAULT_TRACK_STEP_SIZE: int = 5
     MAX_CHUNK_SIZE: int = 50
     MAX_RETRIES: int = 3
@@ -53,7 +47,7 @@ class Config:
     
     # Timing
     RELAY_DURATION: int = 2
-    RELAY_COOLDOWN_SECONDS: int = 4 # 2-4 = 2s cd in consecutive detection/obj staying still
+    RELAY_COOLDOWN_SECONDS: int = 4
     HOME_COOLDOWN_SECONDS: int = 5
     LOST_OBJECT_TIMEOUT: int = 5
     
@@ -69,10 +63,10 @@ class Config:
     
     def __post_init__(self):
         if self.TARGET_OBJECTS is None:
-            self.TARGET_OBJECTS = ['cat', 'dog', 'cell phone'] #change the object here
+            self.TARGET_OBJECTS = ['cat', 'dog', 'cell phone']
 
+# Handles stepper motor control and position tracking
 class StepperController:
-    """Handles stepper motor control and position tracking"""
     
     def __init__(self, arduino_serial: serial.Serial, config: Config):
         self.arduino = arduino_serial
@@ -87,15 +81,15 @@ class StepperController:
         self._homing_complete_event = threading.Event()
         self._homing_complete_callback = None
         
+    # Send step command to Arduino and wait for confirmation
     def send_step_command(self, axis: str, direction: str, steps: int) -> bool:
-        """Send step command to Arduino and wait for confirmation"""
         cmd = f"STEP {axis} {direction} {steps}\n"
         
         try:
             with self._lock:
                 # Clear any pending data before sending command
                 self.arduino.reset_input_buffer()
-                time.sleep(0.01)  # Reduced from 0.1 to 0.01
+                time.sleep(0.01)
                 
                 self.arduino.write(cmd.encode())
                 self.arduino.flush()  # Ensure data is sent
@@ -121,7 +115,7 @@ class StepperController:
                         except UnicodeDecodeError:
                             logger.warning("Received malformed data from Arduino")
                             continue
-                    time.sleep(0.001)  # Reduced from 0.01 to 0.001
+                    time.sleep(0.001)
                 
                 logger.error(f"Timeout waiting for {axis}_OK acknowledgment")
                 logger.debug(f"All responses received: {responses_received}")
@@ -131,8 +125,9 @@ class StepperController:
             logger.error(f"Error sending step command: {e}")
             return False
     
+    # Update position tracking after successful movement
     def _update_position(self, axis: str, direction: str, steps: int) -> None:
-        """Update position tracking after successful movement"""
+        
         if axis == "X":
             old_pos = self.current_pos_x
             if direction == "FORWARD":
@@ -148,8 +143,8 @@ class StepperController:
                 self.current_pos_y -= steps
             logger.debug(f"Y position updated: {old_pos} -> {self.current_pos_y}")
     
+    # Move X axis and update position tracking
     def step_x(self, direction: str, steps: int) -> bool:
-        """Move X axis and update position tracking"""
         logger.debug(f"Moving X axis: {direction} {steps} steps. Current pos: {self.current_pos_x}")
         if self.send_step_command("X", direction, steps):
             self._update_position("X", direction, steps)
@@ -158,8 +153,8 @@ class StepperController:
             logger.error("X step command failed - position not updated")
             return False
     
+    # Move Y axis and update position tracking
     def step_y(self, direction: str, steps: int) -> bool:
-        """Move Y axis and update position tracking"""
         logger.debug(f"Moving Y axis: {direction} {steps} steps. Current pos: {self.current_pos_y}")
         if self.send_step_command("Y", direction, steps):
             self._update_position("Y", direction, steps)
@@ -168,8 +163,8 @@ class StepperController:
             logger.error("Y step command failed - position not updated")
             return False
     
+    # Test Arduino connection with a simple command
     def test_connection(self) -> bool:
-        """Test Arduino connection with a simple command"""
         logger.info("Testing Arduino connection...")
         
         test_success = self.send_step_command("X", "FORWARD", 1)
@@ -180,9 +175,9 @@ class StepperController:
         else:
             logger.error("Connection test failed!")
             return False
-    
+
+    # Return both axes to zero position
     def go_home(self) -> bool:
-        """Return both axes to logical zero position (async)"""
         if self.is_homing:
             logger.warning("Homing already in progress...")
             return False
@@ -192,16 +187,16 @@ class StepperController:
         threading.Thread(target=self._go_home_thread, daemon=True).start()
         return True
     
+    # Set callback to be called when homing is complete
     def set_homing_complete_callback(self, callback):
-        """Set callback to be called when homing is complete"""
         self._homing_complete_callback = callback
-    
+
+    # Wait for homing to complete with timeout
     def wait_for_homing_complete(self, timeout: float = 30.0) -> bool:
-        """Wait for homing to complete with timeout"""
         return self._homing_complete_event.wait(timeout)
     
+    # Private method to handle homing in a separate thread
     def _go_home_thread(self) -> bool:
-        """Private method to handle homing in a separate thread"""
         logger.info(f"Going home from position: ({self.current_pos_x}, {self.current_pos_y})")
         
         self.is_homing = True
@@ -217,16 +212,16 @@ class StepperController:
             # Clear any pending data
             with self._lock:
                 self.arduino.reset_input_buffer()
-                time.sleep(0.05)  # Reduced from 0.2 to 0.05
+                time.sleep(0.05)
             
-            # Home Y axis first (usually safer)
+            # Home Y axis first
             if self.current_pos_y != 0:
                 logger.info("Homing Y axis first...")
                 home_success = self._home_axis("Y", self.current_pos_y)
                 if not home_success:
                     logger.error("Y axis homing failed!")
                     return False
-                time.sleep(0.1)  # Reduced from 0.5 to 0.1
+                time.sleep(0.1)
             
             # Then home X axis
             if self.current_pos_x != 0:
@@ -254,8 +249,8 @@ class StepperController:
             
         return home_success
     
+    # Home a single axis with chunked movement and retry logic
     def _home_axis(self, axis: str, current_pos: int) -> bool:
-        """Home a single axis with chunked movement and retry logic"""
         direction = "BACKWARD" if current_pos > 0 else "FORWARD"
         steps = abs(current_pos)
         logger.info(f"Homing {axis} axis: {steps} steps {direction}")
@@ -278,7 +273,7 @@ class StepperController:
                 retry_count = 0
                 consecutive_failures = 0
                 logger.debug(f"{axis} homing progress: {steps - remaining_steps}/{steps} steps")
-                time.sleep(0.01)  # Reduced from 0.1 to 0.01
+                time.sleep(0.01)
             else:
                 retry_count += 1
                 consecutive_failures += 1
@@ -287,18 +282,18 @@ class StepperController:
                 if consecutive_failures >= 2:
                     # Try to reset communication
                     logger.warning("Multiple consecutive failures, resetting communication...")
-                    time.sleep(0.1)  # Reduced from 0.5 to 0.1
+                    time.sleep(0.1)
                     with self._lock:
                         self.arduino.reset_input_buffer()
                         self.arduino.reset_output_buffer()
-                    time.sleep(0.1)  # Reduced from 0.5 to 0.1
+                    time.sleep(0.1)
                     
                 if retry_count >= self.config.MAX_RETRIES:
                     logger.error(f"{axis} homing failed after maximum retries!")
                     return False
-                    
-                time.sleep(0.1)  # Reduced from 0.5 to 0.1
-        
+
+                time.sleep(0.1)
+
         if remaining_steps == 0:
             # Verify position is actually zero
             if axis == "X":
@@ -311,8 +306,8 @@ class StepperController:
             logger.error(f"{axis} homing incomplete! {remaining_steps} steps remaining")
             return False
     
+    # Handle home cooldown in a separate thread
     def _home_cooldown_thread(self) -> None:
-        """Handle home cooldown in a separate thread"""
         self.home_cooldown_active = True
         logger.info(f"Starting {self.config.HOME_COOLDOWN_SECONDS}-second home cooldown...")
         
@@ -323,8 +318,8 @@ class StepperController:
         self.home_cooldown_active = False
         logger.info("Home cooldown complete. Ready to resume operations.")
     
+    # Track object by calculating error and moving steppers accordingly
     def track_object(self, frame_center: Tuple[int, int], object_center: Tuple[int, int]) -> Tuple[bool, bool]:
-        """Track object by calculating error and moving steppers accordingly"""
         error_x = frame_center[0] - object_center[0]
         error_y = frame_center[1] - object_center[1]
         
@@ -332,20 +327,16 @@ class StepperController:
         
         moved = False
         
-        # Calculate proportional step size - smaller steps as we get closer
-        # Min of 1 step, max of track_step_size
         def calculate_step_size(error, axis):
-            # Calculate a proportional step based on error magnitude
-            # Larger errors = larger steps, smaller errors = smaller steps
             abs_error = abs(error)
             if abs_error <= self.tolerance:
                 return 0
             
             # Scale factor to reduce step size as we get closer
             if abs_error > 100:
-                proportion = 1.0  # Full step size for large errors
+                proportion = 1.0
             else:
-                proportion = abs_error / 100.0  # Proportionally smaller steps
+                proportion = abs_error / 100.0
                 
             # Ensure minimum step of 1, maximum of track_step_size
             step = max(1, min(round(self.track_step_size * proportion), self.track_step_size))
@@ -358,7 +349,7 @@ class StepperController:
             direction = "FORWARD" if error_x > 0 else "BACKWARD"
             if self.step_x(direction, x_step_size):
                 moved = True
-                time.sleep(0.01)  # Reduced from 0.05 to 0.01
+                time.sleep(0.01)
         
         # Move Y axis if error is above tolerance with proportional step size
         y_step_size = calculate_step_size(error_y, "Y")
@@ -366,30 +357,29 @@ class StepperController:
             direction = "FORWARD" if error_y > 0 else "BACKWARD"
             if self.step_y(direction, y_step_size):
                 moved = True
-                time.sleep(0.01)  # Reduced from 0.05 to 0.01
+                time.sleep(0.01)
         
         # Check if aligned
         aligned = abs(error_x) <= self.tolerance and abs(error_y) <= self.tolerance
         if aligned:
             logger.debug("ALIGNED")
         elif moved:
-            # If we made movements, give a brief pause to let the system stabilize
-            time.sleep(0.01)  # Reduced from 0.1 to 0.01
-            
+            time.sleep(0.01)
+
         return aligned, moved
     
+    # Perform one scan step if ready
     def scan_step(self, direction: str, step_size: int) -> bool:
-        """Perform one scan step if ready"""
         if not self.is_ready_for_operations():
             return False
         return self.step_x(direction, step_size)
     
+    #  Check if the stepper is ready for normal operations
     def is_ready_for_operations(self) -> bool:
-        """Check if the stepper is ready for normal operations"""
         return not (self.is_homing or self.home_cooldown_active)
     
+    # Get current status of the stepper controller
     def get_status(self) -> str:
-        """Get current status of the stepper controller"""
         if self.is_homing:
             return "HOMING"
         elif self.home_cooldown_active:
@@ -397,12 +387,12 @@ class StepperController:
         else:
             return "READY"
     
+    # Get current position
     def get_position(self) -> Tuple[int, int]:
-        """Get current position"""
         return (self.current_pos_x, self.current_pos_y)
     
+    # Emergency stop - clear all buffers and stop homing
     def emergency_stop(self) -> None:
-        """Emergency stop - clear all buffers and stop homing"""
         self.is_homing = False
         self.home_cooldown_active = False
         with self._lock:
@@ -410,8 +400,8 @@ class StepperController:
             self.arduino.reset_output_buffer()
         logger.warning("Emergency stop activated - buffers cleared")
     
+    # Force synchronous homing for shutdown
     def force_go_home_sync(self) -> None:
-        """Force synchronous homing for shutdown - blocks until complete"""
         if self.is_homing:
             logger.info("Waiting for current homing to complete...")
             if not self.wait_for_homing_complete(30.0):
@@ -426,8 +416,8 @@ class StepperController:
         finally:
             self.is_homing = False
 
+    # Update tracking parameters
     def set_tracking_parameters(self, tolerance: Optional[int] = None, step_size: Optional[int] = None) -> None:
-        """Update tracking parameters"""
         if tolerance is not None:
             self.tolerance = tolerance
             logger.info(f"Tolerance updated to: {self.tolerance}")
@@ -435,14 +425,14 @@ class StepperController:
             self.track_step_size = step_size
             logger.info(f"Tracking step size updated to: {self.track_step_size}")
     
+    # Manually reset position counters
     def manual_reset_position(self, x: int = 0, y: int = 0) -> None:
-        """Manually reset position counters"""
         self.current_pos_x = x
         self.current_pos_y = y
         logger.info(f"Position manually reset to: ({x}, {y})")
     
+    # Get detailed position information
     def get_position_info(self) -> Dict[str, Any]:
-        """Get detailed position information"""
         return {
             'x_position': self.current_pos_x,
             'y_position': self.current_pos_y,
@@ -453,19 +443,18 @@ class StepperController:
             'home_cooldown_active': self.home_cooldown_active
         }
 
+# Handles relay control for the deterrent mechanism
 class RelayController:
-    """Handles relay control for the deterrent mechanism"""
     
     def __init__(self, config: Config):
         self.config = config
         self.relay_pin = config.RELAY_PIN
         GPIO.setup(self.relay_pin, GPIO.OUT)
-        GPIO.output(self.relay_pin, GPIO.HIGH)  # Initially off, but values inverted. HIGH = 0 here (temp fix)
-        
+        GPIO.output(self.relay_pin, GPIO.HIGH)
         self.alarm = AlarmController(self.config)
         
+    # Trigger relay for specified duration
     def trigger_relay(self, duration: int = None) -> None:
-        """Trigger relay for specified duration - NON-BLOCKING VERSION"""
         if duration is None:
             duration = self.config.RELAY_DURATION
             
@@ -481,36 +470,36 @@ class RelayController:
         # Run in separate thread to avoid blocking
         threading.Thread(target=relay_operation, daemon=True).start()
     
+    # Trigger relay asynchronously
     def trigger_relay_async(self, duration: int = None) -> None:
-        """Trigger relay asynchronously - alias for consistency"""
         self.trigger_relay(duration)
 
+#  Handles alarm system control
 class AlarmController:
-    """Handles alarm system control"""
     
     def __init__(self, config: Config):
         self.config = config
         self.alarm_pin = config.ALARM_PIN
         GPIO.setup(self.alarm_pin, GPIO.OUT)
         
+    # Turn alarm on    
     def alarm_on(self) -> None:
-        """Turn alarm on"""
         GPIO.output(self.alarm_pin, GPIO.HIGH)
-        
+    
+    # Turn alarm off
     def alarm_off(self) -> None:
-        """Turn alarm off"""
         GPIO.output(self.alarm_pin, GPIO.LOW)
 
+# Handles object detection using OpenCV DNN
 class ObjectDetector:
-    """Handles object detection using OpenCV DNN"""
     
     def __init__(self, config: Config):
         self.config = config
         self.class_names = self._load_class_names()
         self.net = self._initialize_model()
         
+    # Load class names from coco.names file
     def _load_class_names(self) -> List[str]:
-        """Load class names from coco.names file"""
         try:
             with open(self.config.COCO_NAMES_PATH, "rt") as f:
                 return f.read().rstrip("\n").split("\n")
@@ -518,8 +507,8 @@ class ObjectDetector:
             logger.error(f"Class names file not found: {self.config.COCO_NAMES_PATH}")
             return []
     
+    # Initialize the detection model
     def _initialize_model(self) -> cv2.dnn_DetectionModel:
-        """Initialize the detection model"""
         try:
             net = cv2.dnn_DetectionModel(self.config.MODEL_PATH, self.config.CONFIG_PATH)
             net.setInputSize(*self.config.INPUT_SIZE)
@@ -566,8 +555,8 @@ class ObjectDetector:
             logger.error(f"Object detection failed: {e}")
             return img, []
 
+# Handles scanning behavior when no object is tracked
 class ScanController:
-    """Handles scanning behavior when no object is tracked"""
     
     def __init__(self, config: Config, stepper: StepperController):
         self.config = config
@@ -575,8 +564,8 @@ class ScanController:
         self.scan_direction = "FORWARD"
         self.scan_steps = 0
         
+    # Perform one scan step if ready
     def perform_scan_step(self) -> bool:
-        """Perform one scan step if ready"""
         if not self.stepper.is_ready_for_operations():
             status = self.stepper.get_status()
             if status == "HOME_COOLDOWN":
@@ -598,14 +587,13 @@ class ScanController:
             logger.warning("Scan step failed, retrying...")
             return False
     
+    # Reset scan parameters
     def reset_scan(self) -> None:
-        """Reset scan parameters"""
         self.scan_steps = 0
         self.scan_direction = "FORWARD"
 
-class PawStopperRobot:
-    """Main robot controller class"""
-    
+# Main robot controller class
+class PawStopperRobot:    
     def __init__(self, config: Config = None):
         self.config = config or Config()
         GPIO.setmode(GPIO.BCM)
@@ -630,15 +618,15 @@ class PawStopperRobot:
         # Initialize camera
         self.cap = self._initialize_camera()
     
+    # Callback function called when homing is complete
     def _on_homing_complete(self) -> None:
-        """Callback function called when homing is complete"""
         logger.info("Homing complete - resetting scanner state")
         self.scanner.reset_scan()
         self.object_tracked = False
         self.lost_since = None
         
+    # Initialize Arduino serial connection
     def _initialize_arduino(self) -> serial.Serial:
-        """Initialize Arduino serial connection"""
         try:
             arduino = serial.Serial(
                 self.config.ARDUINO_PORT, 
@@ -665,8 +653,8 @@ class PawStopperRobot:
             logger.error(f"Failed to initialize Arduino: {e}")
             raise
     
+    # Initialize camera
     def _initialize_camera(self) -> cv2.VideoCapture:
-        """Initialize camera"""
         try:
             cap = cv2.VideoCapture(0)
             cap.set(3, self.config.CAMERA_WIDTH)
@@ -677,8 +665,8 @@ class PawStopperRobot:
             logger.error(f"Failed to initialize camera: {e}")
             raise
     
+    # Display UI information on the image
     def _display_ui_info(self, img) -> None:
-        """Display UI information on the image"""
         pos_x, pos_y = self.stepper.get_position()
         status = self.stepper.get_status()
         
@@ -693,8 +681,8 @@ class PawStopperRobot:
         cv2.putText(img, "Controls: Q=Quit, R=Reset, H=Home, P=Info", 
                     (10, img.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
     
+    # Handle object tracking logic
     def _handle_object_tracking(self, img, object_info) -> bool:
-        """Handle object tracking logic"""
         biggest_box = None
         max_area = 0
         alarm_triggered = False
@@ -739,16 +727,14 @@ class PawStopperRobot:
                 self.relay.trigger_relay_async(self.config.RELAY_DURATION)
                 
                 self.last_trigger_time = current_time
-                
-                # Add a small delay after triggering to avoid immediate movement
-                time.sleep(0.01)  # Reduced from 0.2 to 0.01
+                time.sleep(0.01) 
             
             return True
         
         return False
     
+    # Handle logic when object is lost
     def _handle_object_lost(self) -> None:
-        """Handle logic when object is lost"""
         current_time = time.time()
         
         if self.object_tracked:
@@ -776,8 +762,8 @@ class PawStopperRobot:
             if self.stepper.is_ready_for_operations():
                 self.scanner.perform_scan_step()
     
+    # Handle keyboard input, returns True if should quit
     def _handle_keyboard_input(self) -> bool:
-        """Handle keyboard input, returns True if should quit"""
         key = cv2.waitKey(1) & 0xFF
         
         if key == ord('q'):
@@ -799,8 +785,8 @@ class PawStopperRobot:
             
         return False
     
+    # Main robot control loop
     def run(self) -> None:
-        """Main robot control loop"""
         logger.info("Starting PawStopper Robot...")
         
         try:
@@ -839,8 +825,8 @@ class PawStopperRobot:
         finally:
             self.cleanup()
     
+    # Clean up resources
     def cleanup(self) -> None:
-        """Clean up resources"""
         logger.info("Cleaning up...")
         self.stepper.emergency_stop()
         if hasattr(self, 'cap'):
@@ -852,7 +838,6 @@ class PawStopperRobot:
         logger.info("Cleanup complete!")
 
 def main():
-    """Main entry point"""
     try:
         config = Config()
         robot = PawStopperRobot(config)
